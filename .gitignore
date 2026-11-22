@@ -1,0 +1,20 @@
+# 数据与产物——绝不进仓库
+data/
+snapshots/
+out/
+capture*.jsonl
+*.db
+*.db-wal
+*.db-shm
+
+# 开发环境
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 过程证据（含本机路径与演示数据）
+RUNLOG.md
+
+# OS
+.DS_Store
