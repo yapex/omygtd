@@ -145,6 +145,12 @@ def when_label(entry: dict, day: str) -> str:
     return prefix or part or "今天"
 
 
+def repeat_label(entry: dict) -> str:
+    """周期标签「每 N 天」；一次性任务返回空串（条目流里可能没有这个键）。"""
+    days = entry.get("repeat_days")
+    return f"每 {days} 天" if days else ""
+
+
 def _by_category(entries: list[dict]) -> list[tuple[str, list[dict]]]:
     order, buckets = [], {}
     for entry in entries:
@@ -189,7 +195,8 @@ class MdRenderer:
         day = ctx["day"]
         entries = select_view(stream, view, day)
         lines = [f"## {VIEW_TITLES[view]} · {day}（{len(entries)} 条）", "",
-                 "| # | id | 任务 | 分类 | 时间 | 状态 |", "|---|---|---|---|---|---|"]
+                 "| # | id | 任务 | 分类 | 时间 | 周期 | 状态 |",
+                 "|---|---|---|---|---|---|---|"]
         lines += [self._row(entry, day) for entry in entries]
         return Artifact(text="\n".join(lines) + "\n", mime="text/markdown; charset=utf-8")
 
@@ -198,7 +205,7 @@ class MdRenderer:
         seq = entry.get("seq") if entry.get("seq") is not None else "-"
         cells = [str(seq), str(entry.get("id")), entry.get("title") or "",
                  entry.get("category") or "", when_label(entry, day),
-                 STATUS_CN.get(entry.get("status"), "")]
+                 repeat_label(entry), STATUS_CN.get(entry.get("status"), "")]
         return "| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |"
 
 
@@ -455,7 +462,16 @@ def _row_with(entry, tag_text: str, tag_cls: str, show_seq: bool, number=None):
 
 
 def _tag_text(entry, day, ctx) -> tuple[str, str]:
-    """标签文字与样式类。优先级：逾期 > 等待 > 只有 defer > 收件箱天数 > 时间。"""
+    """标签文字与样式类；周期任务在后面加「· 每 N 天」。"""
+    text, cls = _base_tag(entry, day, ctx)
+    cycle = repeat_label(entry)
+    if cycle and text:
+        return f"{text} · {cycle}", cls
+    return cycle or text, cls
+
+
+def _base_tag(entry, day, ctx) -> tuple[str, str]:
+    """优先级：逾期 > 等待 > 只有 defer > 收件箱天数 > 时间。"""
     due = entry.get("due") or ""
     if is_open(entry) and due and due < day:
         return f"逾期 {_overdue_days(due, day)} 天", "late"

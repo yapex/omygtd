@@ -77,7 +77,8 @@ def _emit(payload: dict, text: str | None = None) -> None:
 def cmd_add(store, args) -> Result:
     return Result(store.add(args.title, due=args.due, slot=args.slot,
                             category=args.category, waiting_on=args.waiting_on,
-                            defer=args.defer, note=args.note, dup_ok=args.dup_ok))
+                            defer=args.defer, note=args.note, dup_ok=args.dup_ok,
+                            repeat_days=args.repeat_days))
 
 
 def cmd_clarify(store, args) -> Result:
@@ -96,6 +97,8 @@ def cmd_drop(store, args) -> Result:
 def cmd_edit(store, args) -> Result:
     fields = {key: getattr(args, key) for key in EDIT_FIELDS
               if getattr(args, key, None) is not None}
+    if args.repeat_days is not None:
+        fields["repeat_days"] = args.repeat_days
     return Result(store.edit(args.id, day=args.day, **fields))
 
 
@@ -196,6 +199,8 @@ def _add(sub):
     p.add_argument("--waiting-on", dest="waiting_on")
     p.add_argument("--defer")
     p.add_argument("--note")
+    p.add_argument("--repeat-days", dest="repeat_days", metavar="N",
+                   help="周期任务：每 N 天（1..365）；必须同时给 --due")
     p.add_argument("--dup-ok", dest="dup_ok", action="store_true")
 
 
@@ -228,6 +233,8 @@ def _edit(sub):
     for flag in ("--title", "--due", "--slot", "--category", "--note",
                  "--waiting-on", "--defer"):
         p.add_argument(flag)
+    p.add_argument("--repeat-days", dest="repeat_days", metavar="N",
+                   help="每 N 天；0 或空串表示取消周期")
     p.add_argument("--day")
 
 

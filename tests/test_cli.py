@@ -11,10 +11,16 @@ import re
 import sqlite3
 import subprocess
 import sys
+from datetime import date, timedelta
 
 import pytest
 
 from gtd import cli
+from gtd import store as gstore
+
+
+def _today_plus(days: int) -> str:
+    return (date.fromisoformat(gstore.today_str()) + timedelta(days=days)).isoformat()
 
 
 def run(capsys, *argv):
@@ -218,3 +224,73 @@ def test_module_entrypoint_works(db_env):
                           cwd=str(db_env.parent))
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["ok"] in (True, False)
+
+
+# ================================================================
+# 周期任务（repeat_days）：命令层
+# ================================================================
+
+def test_add_repeat_without_due_rejected(db_env, capsys):
+    """周期任务必须带 due（第一次到期日），否则拒绝，退出码 1。"""
+    code, out, _ = run(capsys, "add", "领券", "--repeat-days", "5")
+    assert code == 1 and payload(out)["ok"] is False
+    assert "due" in payload(out)["error"]
+
+
+def test_add_repeat_days_out_of_range_rejected(db_env, capsys):
+    for bad in ("0", "-1", "366"):
+        code, out, _ = run(capsys, "add", "领券", "--due", "2026-11-22",
+                           "--repeat-days", bad)
+        assert code == 1 and payload(out)["ok"] is False, bad
+
+
+def test_repeat_done_reports_next_due(db_env, capsys):
+    """done 的 JSON 要带 repeat.days / next_due / done_count。"""
+    _, out, _ = run(capsys, "add", "拼多多领券", "--due", gstore.today_str(),
+                    "--repeat-days", "5", "--category", "购物")
+    tid = payload(out)["id"]
+    code, out, _ = run(capsys, "done", str(tid))
+    data = payload(out)
+    assert code == 0 and data["repeat"] == {
+        "days": 5, "next_due": _today_plus(5), "done_count": 1}
+
+
+def test_repeat_done_then_undo_reappears(db_env, capsys):
+    """端到端口径：今日视图 → done 消失 → undo 重新出现。"""
+    day = gstore.today_str()
+    run(capsys, "add", "拼多多领券", "--due", day, "--repeat-days", "5")
+    before = run(capsys, "board", "--view", "today", "--format", "md", "--day", day)[1]
+    assert "拼多多领券" in before and "每 5 天" in before
+    run(capsys, "done", "1")
+    after = run(capsys, "board", "--view", "today", "--format", "md", "--day", day)[1]
+    assert "拼多多领券" not in after
+    run(capsys, "undo")
+    back = run(capsys, "board", "--view", "today", "--format", "md", "--day", day)[1]
+    assert "拼多多领券" in back
+
+
+def test_board_md_has_repeat_column(db_env, capsys):
+    run(capsys, "add", "拼多多领券", "--due", "2026-11-22", "--repeat-days", "5")
+    run(capsys, "add", "一次性的事", "--due", "2026-11-22")
+    code, out, _ = run(capsys, "board", "--view", "today", "--format", "md",
+                       "--day", "2026-11-22")
+    rows = [line for line in out.splitlines() if line.startswith("| ")
+            and not line.startswith("| # ")]
+    assert code == 0 and "| 周期 |" in out
+    assert sum("每 5 天" in row for row in rows) == 1, rows
+
+
+def test_board_json_has_repeat_fields(db_env, capsys):
+    run(capsys, "add", "拼多多领券", "--due", "2026-11-22", "--repeat-days", "5")
+    code, out, _ = run(capsys, "board", "--view", "today", "--format", "json",
+                       "--day", "2026-11-22")
+    entry = payload(out)["entries"][0]
+    assert code == 0 and entry["repeat_days"] == 5 and entry["done_count"] == 0
+
+
+def test_edit_repeat_days_sets_and_cancels(db_env, capsys):
+    run(capsys, "add", "领券", "--due", "2026-11-22")
+    code, out, _ = run(capsys, "edit", "1", "--repeat-days", "5")
+    assert code == 0 and payload(out)["changed"]["repeat_days"] == 5
+    code, out, _ = run(capsys, "edit", "1", "--repeat-days", "0")
+    assert code == 0 and payload(out)["changed"]["repeat_days"] is None

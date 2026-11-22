@@ -310,3 +310,70 @@ GTD 已上线，`data/gtd.db` 里是真实数据。开发/测试与正式数据*
 - 命令层测试用 `tmp_path` 下的文件库：一个用例里要跨多次 `cli.main()` 调用共享状态，内存库做不到。
 - WAL 断言按库类型分支：内存库断言 `memory`，文件库断言 `wal`。
 - 任何测试都**不许**把 `GTD_CAPTURE` 留空 —— 留空就落到真实 `capture.jsonl`，等于污染原话。
+
+## 十六、周期任务
+
+### 16.1 规则：从「今天」起算
+
+拼多多领券这类事，商家按固定节奏刷新，跟你什么时候点完成无关。所以：
+
+**下一个到期日 = 点完成的那天（今天）+ N 天**，不是「原到期日 + N 天」。
+
+- 例：原 due `2026-11-20`、周期 5 天，今天 `2026-11-22` 点完成 → 下一个 due = `2026-11-27`（不是 `11-25`）。
+- 只做「每 N 天」一种节奏，不做每周/每月/cron 表达式，也不建任何 cron。
+
+### 16.2 数据模型（schema_version 2）
+
+`tasks` 与 `tasks_archive` 各加两列：
+
+| 列 | 类型 | 含义 |
+|---|---|---|
+| `repeat_days` | INTEGER，可空 | NULL = 一次性；有效范围 1..365 |
+| `done_count` | INTEGER NOT NULL DEFAULT 0 | 累计完成次数；一次性任务恒为 0 |
+
+迁移写在 `Store.init()` 的 `_migrate()` 里：先 `pragma table_info` 查列，缺哪列才 `alter table ... add column`，所以重复跑安全；`meta.schema_version` 从 `INSERT OR IGNORE` 改成 upsert，旧库从 `1` 升到 `2`，数据原样保留。任何 gtd 命令都走 `init()`，所以旧库被任意命令碰到的第一次就自动升级。
+
+### 16.3 `done` 的分叉
+
+| | 一次性任务 | 周期任务（`repeat_days` 非空） |
+|---|---|---|
+| status | `done` | 保持 `next` |
+| due | 不动 | `today + repeat_days` |
+| defer | 不动 | 清空 |
+| completed_at | 首次完成时刻（重复点不动） | 每次都写本次完成时刻 |
+| done_count | 0 | +1 |
+
+- 同一天对同一条周期任务连点 `done`：`completed_at` 已是今天 → 视为重复，`duplicate: true`，不滚 due、不加 `done_count`（防手滑把 5 天滚成 10 天）。
+- 完成后 JSON 多一段（一次性任务没有这个字段）：
+
+```json
+{"ok": true, "id": 12, "repeat": {"days": 5, "next_due": "2026-11-27", "done_count": 3}}
+```
+
+批量 `done` 里有多条周期任务时字段叫 `repeats`（数组）。
+
+### 16.4 `add` / `edit`
+
+- `gtd add "领券" --due 2026-11-22 --repeat-days 5`：周期任务**必须带 due**（第一次到期日），否则 `ParamError`。
+- `gtd edit 12 --repeat-days 5`；`--repeat-days 0` 或 `--repeat-days ""` 表示取消周期。
+- 1..365 之外（0 / 负数 / 366 / 非整数）一律 `ParamError`。
+- `inbox` 条目不能直接变周期：inbox 不许带 due，而周期必须带 due —— 先 clarify。
+- 指纹不变：`fingerprint()` 仍只算 `title|due|slot|category|status`，不含 `repeat_days` —— 同一件事改了周期仍算同一条。
+
+### 16.5 `undo`
+
+撤销一次「周期任务的 done」必须同时回滚三样，少一样就是脏数据：`due` 回原值、`done_count` 回原值、`completed_at` 回原值。
+
+实现：`undo_log.payload` 存整行快照 `before`，另附 `prev_due` / `prev_done_count` / `prev_status` / `prev_completed_at` 四个字段便于人工核对；`_apply_undo` 按快照整行还原。
+
+### 16.6 显示
+
+- md：新增 `周期` 列，值 `每 N 天`；一次性任务留空。
+- json：条目流带 `repeat_days` 与 `done_count`（`board` 与 `show` 都有）。
+- png：周期任务的标签在时间后追加「· 每 N 天」，例 `今天 · 每 5 天`、`逾期 2 天 · 每 5 天`。
+- 三视图骨架、折叠口径、序号规则都不动。
+
+### 16.7 体检与已知口径
+
+- `doctor` 新增两条检查：`repeat_without_due`（周期任务缺 due）、`bad_repeat_days`（超出 1..365）。
+- 周期任务完成也计入顶部「今日完成」统计（`completed_at` 是今天），但**不会**出现在「✓ N 号已完成」那一行 —— 那行只列 `status='done'` 的条目（周期任务仍停在 `next`）。

@@ -17,7 +17,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,7 +31,8 @@ DEFAULT_CATEGORY = "其他"
 SLOT_RE = re.compile(r"^(all|am|pm|(?:before|at):([01]\d|2[0-3]):([0-5]\d))$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
+REPEAT_DAYS_MAX = 365
 IDEM_WINDOW_SECONDS = 120
 RETRY_DELAYS = (0.2, 0.5)
 CAPTURE_ROTATE_BYTES = 10 * 1024 * 1024
@@ -175,6 +176,31 @@ def slot_time(slot: str) -> str | None:
     return None
 
 
+# ---- 周期任务（repeat_days） ----
+
+def _clean_repeat_days(value) -> int:
+    """周期天数严格校验：必须 1..365，0 / 负数 / 366 / 非整数一律拒。"""
+    try:
+        days = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ParamError(f"repeat_days 必须是整数：{value!r}") from exc
+    if not 1 <= days <= REPEAT_DAYS_MAX:
+        raise ParamError(f"repeat_days 必须在 1..{REPEAT_DAYS_MAX}：{value!r}")
+    return days
+
+
+def _edit_repeat_days(value) -> int | None:
+    """edit 专用：0 或空串 = 取消周期（None）；其余同 add 的严格校验。"""
+    text = "" if value is None else str(value).strip()
+    return None if text in ("", "0") else _clean_repeat_days(text)
+
+
+def roll_due(day: str, repeat_days: int) -> str:
+    """下一个到期日 = **今天** + N 天（不从原到期日起算）。"""
+    return (datetime.strptime(day, "%Y-%m-%d").date()
+            + timedelta(days=int(repeat_days))).isoformat()
+
+
 def _age_seconds(stamp: str | None) -> float:
     if not stamp:
         return 1e9
@@ -215,6 +241,8 @@ TASK_COLUMNS_SQL = """
     created_at     TEXT    NOT NULL,
     updated_at     TEXT    NOT NULL,
     completed_at   TEXT,
+    repeat_days    INTEGER,
+    done_count     INTEGER NOT NULL DEFAULT 0,
     external_id    TEXT,
     external_kind  TEXT,
     sync_state     TEXT    NOT NULL DEFAULT 'none'
@@ -262,6 +290,11 @@ DOCTOR_CHECKS = (
      "select task_id as id from daily_seq where task_id not in (select id from tasks)"),
     ("done_without_completed_at",
      "select id from tasks where status='done' and coalesce(completed_at,'')=''"),
+    ("repeat_without_due",
+     "select id from tasks where repeat_days is not null and coalesce(due,'')=''"),
+    ("bad_repeat_days",
+     "select id from tasks where repeat_days is not null"
+     f" and (repeat_days < 1 or repeat_days > {REPEAT_DAYS_MAX})"),
 )
 
 
@@ -321,13 +354,27 @@ class Store:
         return self.conn if self.conn is not None else self.connect()
 
     def init(self) -> dict:
-        """建表 + 写 schema_version。重复执行安全。"""
+        """建表 + 迁移 + 写 schema_version。重复执行安全。"""
         conn = self._db()
         conn.executescript(SCHEMA_SQL)
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-                     (SCHEMA_VERSION,))
+        self._migrate(conn)
+        self.meta_set("schema_version", SCHEMA_VERSION)
         return {"ok": True, "db": str(self.db_path), "capture": str(self.capture_path),
                 "schema_version": SCHEMA_VERSION, "wal": self.journal_mode()}
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """v1 → v2：补 repeat_days / done_count 两列（tasks 与归档表都要）。
+
+        先查列再加列，重复执行不报错；已有数据原样保留，新列取默认值。
+        """
+        for table in ("tasks", "tasks_archive"):
+            cols = {row[1] for row in conn.execute(f"pragma table_info({table})")}
+            if "repeat_days" not in cols:
+                conn.execute(f"alter table {table} add column repeat_days INTEGER")
+            if "done_count" not in cols:
+                conn.execute(f"alter table {table} add column done_count INTEGER"
+                             " NOT NULL DEFAULT 0")
 
     def journal_mode(self) -> str:
         return self._db().execute("PRAGMA journal_mode").fetchone()[0].lower()
@@ -510,7 +557,8 @@ class Store:
 
     def changed_of(self, task_id: int) -> dict:
         row = self.get(task_id)
-        keys = ("title", "status", "due", "slot", "category", "waiting_on", "defer", "note")
+        keys = ("title", "status", "due", "slot", "category", "waiting_on", "defer",
+                "note", "repeat_days", "done_count")
         return {k: row[k] for k in keys}
 
     def _result(self, task_id: int, duplicate: bool, changed: dict) -> dict:
@@ -520,18 +568,22 @@ class Store:
     # ---- 命令层入口：写 ----
 
     def add(self, title, due=None, slot=None, category=None, waiting_on=None,
-            defer=None, note=None, dup_ok: bool = False) -> dict:
-        """捕获一条任务。有 due/defer → next，否则 inbox。"""
+            defer=None, note=None, dup_ok: bool = False, repeat_days=None) -> dict:
+        """捕获一条任务。有 due/defer → next，否则 inbox；周期任务必须带 due。"""
         title = _clean_title(title)
         due_v, defer_v = _opt_date(due, "due"), _opt_date(defer, "defer")
         slot_v, category_v = _clean_slot(slot), _clean_category(category)
         waiting_v = (waiting_on or "").strip() or None
+        repeat_v = (_clean_repeat_days(repeat_days)
+                    if repeat_days not in (None, "") else None)
+        if repeat_v is not None and not due_v:
+            raise ParamError("周期任务必须带 due（第一次到期日）")
         status = "next" if (due_v or defer_v) else "inbox"
         validate_task(status, due_v, defer_v, waiting_v)
         idem = fingerprint(title, due_v, slot_v, category_v, status)
         line = self.capture(title, {"cmd": "add", "due": due_v, "defer": defer_v,
                                     "slot": slot_v, "category": category_v,
-                                    "waiting_on": waiting_v})
+                                    "waiting_on": waiting_v, "repeat_days": repeat_v})
         if not dup_ok:
             dup = self._recent_duplicate(idem)
             if dup is not None:
@@ -539,6 +591,7 @@ class Store:
         row = {"title": title, "status": status, "due": due_v, "defer": defer_v,
                "slot": slot_v, "category": category_v, "waiting_on": waiting_v,
                "note": note, "idem_key": idem, "capture_id": line["capture_id"],
+               "repeat_days": repeat_v, "done_count": 0,
                "created_at": now_iso(), "updated_at": now_iso()}
         task_id = self._write(lambda: self._tx(lambda: self._insert_new(row)),
                               capture_id=line["capture_id"])
@@ -565,8 +618,9 @@ class Store:
         return self._result(row["id"], False, merged)
 
     def edit(self, ref, day: str | None = None, **fields) -> dict:
-        """改内容字段；绝不允许改 status。"""
-        allowed = {"title", "due", "defer", "slot", "category", "note", "waiting_on"}
+        """改内容字段；绝不允许改 status。repeat_days 传 0/空串表示取消周期。"""
+        allowed = {"title", "due", "defer", "slot", "category", "note", "waiting_on",
+                   "repeat_days"}
         if "status" in fields:
             raise ParamError("edit 不允许改 status，请用 clarify / done / drop")
         unknown = set(fields) - allowed
@@ -574,13 +628,15 @@ class Store:
             raise ParamError(f"edit 不支持字段：{sorted(unknown)}")
         row = self.require(ref, day)
         merged = self._merge_fields(row, fields)
+        if merged["repeat_days"] is not None and not merged["due"]:
+            raise ParamError("周期任务必须带 due（第一次到期日）")
         validate_task(row["status"], merged["due"], merged["defer"], merged["waiting_on"])
         self._write(lambda: self._tx(lambda: self._update_fields(row["id"], merged)))
         return self._result(row["id"], False, merged)
 
     def _merge_fields(self, row, fields: dict) -> dict:
         merged = {k: row[k] for k in ("title", "due", "defer", "slot", "category",
-                                      "note", "waiting_on")}
+                                      "note", "waiting_on", "repeat_days")}
         if "title" in fields:
             merged["title"] = _clean_title(fields["title"])
         if "due" in fields:
@@ -595,16 +651,65 @@ class Store:
             merged["note"] = fields["note"]
         if "waiting_on" in fields:
             merged["waiting_on"] = (fields["waiting_on"] or "").strip() or None
+        if "repeat_days" in fields:
+            merged["repeat_days"] = _edit_repeat_days(fields["repeat_days"])
         return merged
 
     def complete(self, refs, day: str | None = None) -> dict:
-        """done：可多个；已完成的不动 completed_at。"""
+        """done：一次性任务 → status=done；周期任务 → 从今天起推到 today+N 且保持 next。"""
         rows = [self.require(ref, day) for ref in self._as_list(refs)]
-        todo = [r["id"] for r in rows if r["status"] != "done"]
-        if todo:
-            self._write(lambda: self._tx(lambda: self._set_status(todo, "done", stamp=True)))
-        return self._bulk_result([r["id"] for r in rows], duplicate=not todo,
-                                 changed={"status": "done"})
+        today = today_str()
+        done_ids, repeat_ids = [], []
+        for row in rows:
+            if row["repeat_days"]:
+                if (row["completed_at"] or "")[:10] != today:
+                    repeat_ids.append(row["id"])
+            elif row["status"] != "done":
+                done_ids.append(row["id"])
+        touched = done_ids + repeat_ids
+        if touched:
+            self._write(lambda: self._tx(lambda: self._complete_rows(done_ids, repeat_ids)))
+        ids = [row["id"] for row in rows]
+        changed = self.changed_of(ids[0]) if len(ids) == 1 else {"status": "done"}
+        return self._complete_result(ids, touched, changed)
+
+    def _complete_rows(self, done_ids: list[int], repeat_ids: list[int]) -> int:
+        if done_ids:
+            self._set_status(done_ids, "done", stamp=True)
+        for task_id in repeat_ids:
+            self._roll_repeat(task_id)
+        return len(done_ids) + len(repeat_ids)
+
+    def _roll_repeat(self, task_id: int) -> None:
+        """滚到下一个到期日，并把这几种旧值一起记进 undo payload。"""
+        before = self._public_scalar(self._row_snapshot(task_id))
+        ts, next_due = now_iso(), roll_due(today_str(), before["repeat_days"])
+        self._db().execute(
+            "update tasks set due=?, defer=null, status='next',"
+            " done_count=done_count+1, completed_at=?, updated_at=? where id=?",
+            (next_due, ts, ts, task_id))
+        self._push_undo("update", {"before": [before], "prev_due": before["due"],
+                                   "prev_done_count": before["done_count"],
+                                   "prev_status": before["status"],
+                                   "prev_completed_at": before["completed_at"]})
+
+    def _complete_result(self, ids: list[int], touched: list[int], changed: dict) -> dict:
+        result = self._bulk_result(ids, duplicate=not touched, changed=changed)
+        report = self._repeat_report(ids)
+        if len(report) == 1:
+            result["repeat"] = report[0]
+        elif report:
+            result["repeats"] = report
+        return result
+
+    def _repeat_report(self, ids: list[int]) -> list[dict]:
+        out = []
+        for task_id in ids:
+            row = self.get(task_id)
+            if row["repeat_days"]:
+                out.append({"days": row["repeat_days"], "next_due": row["due"],
+                            "done_count": row["done_count"]})
+        return out
 
     def drop(self, refs, day: str | None = None) -> dict:
         rows = [self.require(ref, day) for ref in self._as_list(refs)]
@@ -771,6 +876,7 @@ class Store:
                 "due": row["due"], "defer": row["defer"], "status": row["status"],
                 "waiting_on": row["waiting_on"], "note": row["note"],
                 "capture_id": row["capture_id"], "completed_at": row["completed_at"],
+                "repeat_days": row["repeat_days"], "done_count": row["done_count"],
                 "created_at": row["created_at"], "updated_at": row["updated_at"],
                 "sync_state": row["sync_state"]}
 

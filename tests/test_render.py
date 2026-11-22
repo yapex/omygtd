@@ -101,6 +101,29 @@ def test_md_has_seq_and_id_columns(mixed_stream):
     assert "| 1 | 101 |" in text
 
 
+# ---------- 周期任务（repeat_days）的显示 ----------
+
+def test_md_has_repeat_column_with_label():
+    repeat = entry(1, "拼多多领券", category="购物")
+    repeat["repeat_days"] = 5
+    oneoff = entry(2, "一次性的事")
+    text = MdRenderer().render([repeat, oneoff], "all", {"day": DAY}).text
+    rows = [line for line in text.splitlines()
+            if line.startswith("| ") and not line.startswith("| # ")]
+    assert "| 周期 |" in text
+    assert rows[0].split("|")[6].strip() == "每 5 天"
+    assert rows[1].split("|")[6].strip() == ""
+
+
+def test_png_repeat_tag_shows_cycle():
+    """today 图里周期任务的标签显示「每 5 天」。"""
+    item = entry(1, "拼多多领券", category="购物")
+    item["repeat_days"] = 5
+    html, _w, _h = build_html([item], "today", {"day": DAY})
+    assert "每 5 天" in visible(html)
+    assert '<span class="tag">今天 · 每 5 天</span>' in html
+
+
 # ---------- json：完整字段 ----------
 
 def test_json_has_all_fields(mixed_stream):
