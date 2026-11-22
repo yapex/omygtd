@@ -11,6 +11,18 @@ metadata:
 
 唯一权威设计见 `~/workspace/gtd/DESIGN.md`。本文件只写「Agent 怎么用」。
 
+## 项目底座
+
+- 目录 `~/workspace/gtd/`；`DESIGN.md` 是唯一权威设计源，与本文件冲突时以它为准。
+- 代码仓 `github.com/yapex/omygtd`：测试绿即直接 commit + push，不等老板批。
+- 数据、`out/`、`RUNLOG` 永不入库。
+- 状态固定四态 `inbox / next / done / dropped`；分类九个（见下表）；**不设 someday / waiting 区**——「等别人」用带日期的条目表达。
+- 二期接 EventKit 写日历/提醒：表已预留 `external_*` / `sync_*` 字段。
+
+## EventKit 坑（二期）
+
+EventKit 经 osascript / python 调用时 TCC 不弹窗（responsible 进程是终端），必须让老板在终端手工授权一次；生产用途要打成签名 .app。
+
 ## 命令
 
 ```
@@ -38,13 +50,28 @@ gtd undo / doctor / backup / init / sync
 | 「5 号改到周五」 | `gtd edit 5 --due YYYY-MM-DD` |
 | 「刚才记错了」 | `gtd undo` |
 
-## 记的时候必须落实的三件事
+## 记的时候必须落实的四件事
 
 1. **时间**：日期 + 时段。说得出就给，说不出就留在 `inbox`（不要硬凑日期）
 2. **分类**：按下表判断，判断不出落「其他」
 3. **是否等别人**：等别人就必须带日期（那是该催的日子）
+4. **记完回图**：写完成功后立刻出**更新后的图片视图**发给老板，不只回一行「记好了」——见下节
 
 **不要问**：要不要记、id 是多少、内部字段是什么。他说记就记。
+
+## 记完必回图（2026-11-22 老板定）
+
+每次 `gtd add` / `gtd clarify` 成功后，立刻生成更新后的图片视图并发给老板：
+
+```bash
+mkdir -p ~/.hermes/cache/terminal/frog/gtd
+gtd board --view today --format png --out ~/.hermes/cache/terminal/frog/gtd/today-$(date +%F).png
+```
+
+- 回复正文：确认条目（标题 / 时间 / 分类 / id），末尾单独一行 `MEDIA:<png 绝对路径>`。
+- **必须用 today 视图**：它的图含「逾期 / 今日完成 / 收件箱 / 下一步」四区，其中 `下一步` 区**会带上未来日期的条目**（实测 11/27 的条目也显示出来），一屏看全，也正是老板每天 7:00 收到的那张。
+- **`today --format md` 只有当日条目，看不到刚记的未来条目**——别拿 md 顶替，也别据此判断「没记上」。要看文字全量用 `categories --format md`。
+- 写失败时不许拿旧图充数，按「失败时怎么说」三条讲清。
 
 ## 分类判断
 
