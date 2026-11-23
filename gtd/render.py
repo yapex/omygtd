@@ -707,7 +707,7 @@ SECTION_ORDER = ("today", "next", "far", "inbox")
 T_WHEN_W = T_SEQ_W + T_AT_W      # 200：「号 + 周五 15:30」正好占序号 + 时刻两列
 T_NEXT_LABEL_H = 40
 T_MORE_H = 34
-# 收件箱区视觉隔离（方案 B）：浅底 + 上方细线，不加任何文字标签。18 + 6 = padding 高。
+# 收件箱区隔离：只靠上方 1px 细线（老板 2026-11-23 去掉了浅底）。18 + 6 = padding 高。
 T_INBOX_BAND_H = 24
 ALL_DAY_LABEL = "全天"
 # 时段闹钟回显成老板说出口的那个词：146px 的 nowrap 列放不下「全天 · 12:00 响」
@@ -1275,7 +1275,7 @@ TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
   .top b { font-weight: 600; color: #6b6259; font-variant-numeric: tabular-nums; }
   .top .sep { margin: 0 16px; color: #cfc7bd; }
   .rows { margin-top: 34px; }
-  .lower { margin: 44px -64px 0; padding: 18px 64px 6px; background: #f1ede4;
+  .lower { margin: 44px -64px 0; padding: 18px 64px 6px;
            border-top: 1px solid #cfc7bd; }
   .next { margin-top: 34px; }
   .far { margin-top: 34px; }

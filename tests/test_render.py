@@ -686,11 +686,12 @@ def test_waiting_list_name_still_printed():
 
 
 def test_inbox_entry_prints_inbox_label_on_the_right():
-    """收件箱条目右侧印 `inbox`（老板 2026-11-23 改回显示），底色与细线照旧并存。"""
+    """收件箱条目右侧印 `inbox`（老板 2026-11-23 改回显示），底色已去掉、细线照旧。"""
     page, *_ = build_today_html([entry("对腾讯的 Q3 财报进行综合分析", kind="inbox")], now=NOW)
     assert '<div class="list">inbox</div>' in page
     assert "inbox" in _lower_block(page)
-    assert "background: #f1ede4" in page, "标签与底色并存：底色不许因为加了标签就去掉"
+    assert "background: #f1ede4" not in page, "老板要去掉底色，标签留着就够区分了"
+    assert re.search(r"\.lower \{[^}]*border-top: 1px solid #cfc7bd", page), "细线保留"
 
 
 def test_hidden_list_column_gives_width_back_to_title():
@@ -737,29 +738,29 @@ def _lower_block(page: str) -> str:
     return page.split('<div class="lower">', 1)[1].split('<div class="foot"', 1)[0]
 
 
-def test_inbox_section_is_isolated_by_light_band_and_hairline():
-    """方案 B：极浅米灰底 + 上方 1px 细线，不做卡片；区里除了 inbox 标签不加别的文字。"""
+def test_inbox_section_is_isolated_by_hairline_alone():
+    """只靠上方 1px 细线隔开（老板 2026-11-23 去掉底色），不做卡片；区里除了 inbox 标签不加别的文字。"""
     page, *_ = build_today_html([entry("今天的事", number=1),
                                  entry("想到一个点子", number=2, kind="inbox")], now=NOW)
     css = page.split("<style>", 1)[1].split("</style>", 1)[0]
     rule = re.search(r"\.lower \{([^}]*)\}", css)
     assert rule is not None, "收件箱区必须有自己的一条样式"
     band = rule.group(1)
-    assert "background: #f1ede4" in band, "整区铺极浅米灰底（页面底是 #f7f5f0）"
+    assert "background" not in band, "去掉底色：收件箱区跟上面同是页面米白 #f7f5f0"
     assert "border-top: 1px solid #cfc7bd" in band, "上方一条细线，用现有分隔色"
     assert "border-radius" not in band, "不做卡片"
     assert re.sub(r"<[^>]+>", "", _lower_block(page).replace('<div class="list">inbox</div>', "")).strip() \
-        == "2想到一个点子", "隔离靠底色：收件箱区里除了老板要的 inbox 标签，不许再加别的文字"
+        == "2想到一个点子", "隔离靠细线：收件箱区里除了老板要的 inbox 标签，不许再加别的文字"
 
 
 def test_inbox_band_is_not_rendered_without_inbox_entries():
-    """收件箱 0 条时整块不渲染：不留一条孤零零的浅色带（估高也不加它的 padding）。"""
+    """收件箱 0 条时整块不渲染：不留一条孤零零的分隔线（估高也不加它的 padding）。"""
     page, _w, _h = build_today_html([entry("今天的事", number=1)], now=NOW)
     assert 'class="lower"' not in page
 
 
 def test_inbox_band_keeps_text_colors_unchanged():
-    """加了底色后文字对比度不许变差：标题/序号的配色一个都没动。"""
+    """去掉底色后文字配色一个都没动：标题/序号/字号照旧。"""
     page, *_ = build_today_html([entry("想到一个点子", number=2, kind="inbox")], now=NOW)
     css = page.split("<style>", 1)[1].split("</style>", 1)[0]
     assert re.search(r"body \{[^}]*color: #1b1815", css), "正文仍是原墨色"
