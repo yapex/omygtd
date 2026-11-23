@@ -3,7 +3,7 @@
 纪律（上一轮踩过坑）：Reminder 是全局的，没有「临时库」。
 - 一律用 `GTD_TEST`，禁止出现真实列表名
 - `_guard_list` 在 pytest 里会拦住真实列表（由 test_guard_* 四连证）
-- fixture `real_list` 无条件清理：成功失败都删掉 GTD_TEST
+- fixture `real_list` 只确保 GTD_TEST 存在（不删整张列表），测试条目各自删掉
 """
 
 from __future__ import annotations
@@ -38,10 +38,14 @@ def _list_titles() -> list[str]:
 
 @pytest.fixture
 def real_list():
-    """专用测试列表：先清残留，用完必删（无论用例成败）。"""
-    _cli(["list", TEST_LIST, "--delete", "--force"])
+    """专用测试列表 GTD_TEST：只**确保它存在**，不删整张列表。
+
+    原来 fixture 前后各 `list GTD_TEST --delete --force`，而 2026-11-23 起 `gtd`
+    把「临时库」的写入都投到这张列表 —— 别的 worker 验收时正在看的那条会被
+    pytest 连带删掉。列表本身留着，测试条目各自 `delete` 收尾。
+    """
+    _cli(["list", TEST_LIST, "--create"])
     yield TEST_LIST
-    _cli(["list", TEST_LIST, "--delete", "--force"])
 
 
 class _Proc:
@@ -145,9 +149,12 @@ def test_real_roundtrip(real_list):
     due = datetime.now().replace(second=0, microsecond=0) + timedelta(days=1)
     rid = adapter.add("pytest 往返", due, real_list, advance_minutes=15)
     assert rid, "add 没拿到 id"
-    assert rid in [item["id"] for item in adapter.pending(real_list)]
-    assert adapter.complete(rid) is True
-    assert rid not in [item["id"] for item in adapter.pending(real_list)]
+    try:
+        assert rid in [item["id"] for item in adapter.pending(real_list)]
+        assert adapter.complete(rid) is True
+        assert rid not in [item["id"] for item in adapter.pending(real_list)]
+    finally:                       # 自己那条自己删：列表不再整张清空
+        adapter.delete(rid)
 
 
 # ---------- 15-16：adapter 参数与失败路径（monkeypatch，不碰真实 Reminder） ----------
@@ -268,9 +275,12 @@ def test_real_read_write_roundtrip_is_self_consistent(real_list):
     due = datetime.now().replace(second=0, microsecond=0) + timedelta(days=1)
     rid = adapter.add("pytest 时区往返", due, real_list, advance_minutes=15)
     assert rid
-    (item,) = [row for row in adapter.pending(real_list) if row["id"] == rid]
-    assert item["dueDate"] == due.strftime("%Y-%m-%d %H:%M")
-    assert item["alarmDate"] == (due - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M")
+    try:
+        (item,) = [row for row in adapter.pending(real_list) if row["id"] == rid]
+        assert item["dueDate"] == due.strftime("%Y-%m-%d %H:%M")
+        assert item["alarmDate"] == (due - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M")
+    finally:                       # 自己那条自己删：列表不再整张清空
+        adapter.delete(rid)
 
 
 # ---------- 24+：全天 / 时段（t_0541f6c3） ----------
