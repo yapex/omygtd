@@ -22,11 +22,13 @@ import json
 import os
 import shutil
 import sys
+import traceback
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from . import __version__, doctor, parser as nlp, priority as prio, repeat as rep, render
+from . import (__version__, audit, doctor, parser as nlp, priority as prio,
+               repeat as rep, render)
 from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
 from .reminders import RemindctlAdapter, ReminderStore
 
@@ -43,6 +45,7 @@ ALL_DAY_WORD = "全天"
 class Result:
     payload: dict
     code: int = EXIT_OK
+    audit: dict | None = None          # 审计材料（parsed / before / after），main 负责落盘
 
 
 @dataclass
@@ -64,18 +67,59 @@ class Context:
 
 def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
     """跑一条命令，返回退出码（0 成功 / 1 业务失败 / 2 参数错误）。"""
+    raw = list(argv) if argv is not None else sys.argv[1:]
     try:
-        args = build_parser().parse_args(argv)
+        args = build_parser().parse_args(raw)
     except SystemExit as exc:          # argparse：未知命令、缺参数 → 2；--help → 0
         return int(exc.code or 0)
     try:
         ctx = _context(args, store, now)
         result = DISPATCH[args.command](ctx, args)
     except (RuntimeError, ValueError, OSError) as exc:
+        _audit(args, raw, None, EXIT_FAIL, {"ok": False, "error": str(exc)},
+               tb=traceback.format_exc())
         _write({"ok": False, "error": str(exc)}, args.human, args.command)
         return EXIT_FAIL
+    _audit(args, raw, result.audit, result.code, result.payload)
     _write(result.payload, args.human, args.command)
     return result.code
+
+
+def _audit(args, raw, material, code, payload, *, tb=None) -> None:
+    """把这条修改类命令写进 oplog；审计是旁路，失败也不影响退出码。"""
+    if args.command not in audit.AUDITED:
+        return
+    audit.log(args.command, {
+        "argv": raw, "db": args.db or os.environ.get("GTD_DB") or DEFAULT_DB,
+        "now": _audit_now(args.now), "exit": code, "error": _error_of(payload),
+        "traceback": _tb_lines(tb), **(material or {}),
+    })
+
+
+def _error_of(payload) -> str | None:
+    """失败原因：顶层 error，或 done 逐条 error 拼一句（日志里要能一眼看到）。"""
+    if not payload:
+        return None
+    if payload.get("error"):
+        return str(payload["error"])
+    problems = [f"#{item.get('seq')} {item.get('error')}"
+                for item in payload.get("results") or () if item.get("error")]
+    return "；".join(problems) or None
+
+
+def _audit_now(raw) -> datetime | None:
+    """``--now`` 注入的业务时刻；没注入就是 None（别让真实时间冒名顶替）。"""
+    if raw is None:
+        return None
+    try:
+        return _moment(raw)
+    except ValueError:
+        return None
+
+
+def _tb_lines(tb) -> list[str] | None:
+    """异常栈末 5 行（调试够用，不落整段）。"""
+    return [line for line in str(tb or "").strip().splitlines() if line]
 
 
 def _context(args, store, now) -> Context:
@@ -181,6 +225,47 @@ def _age_days(row: dict, now: datetime) -> int:
     return max(0, (now.date() - created).days)
 
 
+# ---------------------------------------------------------------- 审计材料
+
+AUDIT_KEYS = ("source", "seq", "inbox_id", "reminder_id", "number", "ref", "priority",
+              "previous", "unchanged", "due", "at", "all_day", "slot", "results")
+
+
+def _audited(result: Result, parsed=None, before=None, after=None) -> Result:
+    """给回执挂上审计三问（parsed / before / after）；after 不给就取回执里的状态。"""
+    result.audit = {
+        "parsed": _parsed_audit(parsed) if parsed is not None else None,
+        "before": before,
+        "after": after if after is not None else _after(result.payload),
+    }
+    return result
+
+
+def _parsed_audit(parsed) -> dict:
+    """解析结果原样进日志：以后「它为什么以为我说了明天下午」不用重放。"""
+    return {"title": parsed.title,
+            "due": parsed.due.isoformat() if parsed.due else None,
+            "at": parsed.at.strftime("%H:%M") if parsed.at else None,
+            "all_day": parsed.all_day, "slot": parsed.slot,
+            "priority": prio.normalize(parsed.priority), "repeat": parsed.repeat,
+            "list": parsed.list, "advance_minutes": parsed.advance_minutes,
+            "matched": parsed.matched}
+
+
+def _after(payload: dict) -> dict:
+    """回执里的状态字段 → 「改之后」快照（不搬渲染文本）。"""
+    return {key: payload[key] for key in AUDIT_KEYS if key in payload}
+
+
+def _inbox_snapshot(row: dict | None) -> dict | None:
+    """inbox 一行 → 审计快照：moved_at / reminder_id 就是「改了什么」的证据。"""
+    if row is None:
+        return None
+    return {"inbox_id": row["id"], "moved_at": row["moved_at"],
+            "reminder_id": row["reminder_id"],
+            "priority": prio.normalize(row.get("priority"))}
+
+
 def _out_root() -> Path:
     return Path(os.environ.get(OUT_ENV) or PROJECT_ROOT / "out")
 
@@ -213,7 +298,7 @@ def cmd_add(ctx: Context, args) -> Result:
     level = args.priority or parsed.priority          # 命令行 --priority 覆盖解析结果
     due_at = _due_at(parsed, ctx.now)
     if due_at is None:
-        return _park(ctx, parsed, args.note, level=level)
+        return _audited(_park(ctx, parsed, args.note, level=level), parsed)
     _ensure_lists(ctx.store)
     reminder_id = ctx.store.add(parsed.title, due_at, _list_of(parsed),
                                 advance_minutes=_advance(parsed),
@@ -221,9 +306,9 @@ def cmd_add(ctx: Context, args) -> Result:
                                 all_day=parsed.all_day, slot=parsed.slot,
                                 priority=level, repeat=parsed.repeat)
     if not reminder_id:
-        return _park(ctx, parsed, args.note, due_at=due_at, level=level,
-                     error="Reminder 写不进去，已留在收件箱")
-    return Result(_landed(ctx, parsed, reminder_id, due_at, level=level))
+        return _audited(_park(ctx, parsed, args.note, due_at=due_at, level=level,
+                              error="Reminder 写不进去，已留在收件箱"), parsed)
+    return _audited(Result(_landed(ctx, parsed, reminder_id, due_at, level=level)), parsed)
 
 
 def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None,
@@ -279,14 +364,16 @@ def cmd_clarify(ctx: Context, args) -> Result:
     """给 inbox 里的念头补时间：Reminder 成功才打迁出标记。"""
     row = _pending_row(ctx, args.number)
     if row is None:
-        return Result({"ok": False,
-                       "error": f"收件箱里没有 #{args.number}（可能已定时间，或者号不存在）"},
-                      code=EXIT_FAIL)
+        return _audited(Result({"ok": False,
+                                "error": f"收件箱里没有 #{args.number}"
+                                         f"（可能已定时间，或者号不存在）"},
+                               code=EXIT_FAIL), before={"number": args.number})
     parsed = nlp.parse(args.text, now=ctx.now)
+    before = _inbox_snapshot(row)
     due_at = _due_at(parsed, ctx.now)
     if due_at is None:
-        return Result({"ok": False, "error": "没听出时间", "inbox_id": row["id"]},
-                      code=EXIT_FAIL)
+        return _audited(Result({"ok": False, "error": "没听出时间", "inbox_id": row["id"]},
+                               code=EXIT_FAIL), parsed, before)
     title = parsed.title or row["title"]
     level = parsed.priority if prio.is_set(parsed.priority) else prio.normalize(row.get("priority"))
     _ensure_lists(ctx.store)
@@ -296,12 +383,13 @@ def cmd_clarify(ctx: Context, args) -> Result:
                                 all_day=parsed.all_day, slot=parsed.slot,
                                 priority=level, repeat=parsed.repeat)
     if not reminder_id:
-        return Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
-                       "inbox_id": row["id"]}, code=EXIT_FAIL)
+        return _audited(Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
+                                "inbox_id": row["id"]}, code=EXIT_FAIL), parsed, before)
     ctx.inbox.mark_moved(row["id"], reminder_id, now=ctx.now)
     payload = _landed(ctx, parsed, reminder_id, due_at, title=title, level=level)
     payload["inbox_id"] = row["id"]
-    return Result(payload)
+    after = _inbox_snapshot(ctx.inbox.get(row["id"]))
+    return _audited(Result(payload), parsed, before, after=after)
 
 
 def _pending_row(ctx: Context, number: int) -> dict | None:
@@ -514,15 +602,34 @@ def cmd_priority(ctx: Context, args) -> Result:
     """
     level = str(args.level).strip().lower()
     if level not in prio.PRIORITIES:
-        return Result({"ok": False,
-                       "error": f"优先级只认 {'/'.join(prio.PRIORITIES)}，收到「{args.level}」"},
-                      code=EXIT_FAIL)
+        return _audited(Result({"ok": False,
+                                "error": f"优先级只认 {'/'.join(prio.PRIORITIES)}，"
+                                         f"收到「{args.level}」"}, code=EXIT_FAIL),
+                        before={"level": args.level})
     try:
         number = int(args.number)
     except (TypeError, ValueError):
-        return Result({"ok": False, "error": f"序号不是整数：{args.number}"}, code=EXIT_FAIL)
+        return _audited(Result({"ok": False, "error": f"序号不是整数：{args.number}"},
+                               code=EXIT_FAIL), before={"number": args.number})
+    before = _priority_snapshot(ctx, number)
     result = _priority_one(ctx, number, level)
-    return Result(result, code=EXIT_OK if result["ok"] else EXIT_FAIL)
+    return _audited(Result(result, code=EXIT_OK if result["ok"] else EXIT_FAIL),
+                    before=before, after=result)
+
+
+def _priority_snapshot(ctx: Context, number: int) -> dict:
+    """改之前那条的档位（号不对就带上原因）；priority 的 before 靠它。"""
+    ref, problem = _board_ref(ctx, number)
+    if problem or ref is None:
+        return {"number": number, "error": problem}
+    kind, _, target = ref.partition(":")
+    if kind == INBOX_LIST_LABEL:
+        row = ctx.inbox.get(int(target))
+        current = prio.normalize(row.get("priority")) if row else None
+    else:
+        item = _reminder_item(ctx, target)
+        current = prio.normalize(item.get("priority")) if item else None
+    return {"number": number, "ref": ref, "priority": current}
 
 
 def _priority_one(ctx: Context, number: int, level: str) -> dict:
@@ -600,9 +707,39 @@ def cmd_done(ctx: Context, args) -> Result:
     号来自 ``board_index``（今天的图，当天不变）。今天还没出过图就报「先看一眼看板」，
     图上没有这个号就报「今天没有 N 号」——绝不猜、不退回去用别处的号。
     """
+    before = _done_snapshot(ctx, args.seqs)      # 先拍快照，拍完再动手
     results = [_done_one(ctx, raw) for raw in args.seqs]
-    return Result({"ok": all(item["ok"] for item in results), "results": results},
-                  code=EXIT_OK if all(item["ok"] for item in results) else EXIT_FAIL)
+    ok = all(item["ok"] for item in results)
+    return _audited(Result({"ok": ok, "results": results},
+                           code=EXIT_OK if ok else EXIT_FAIL),
+                    before=before, after=results)
+
+
+def _done_snapshot(ctx: Context, raws) -> list[dict]:
+    """完成之前每条的状态：号 → 引用 → 已完成 / 收件箱是否已迁出。"""
+    snapshots = []
+    for raw in raws:
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            snapshots.append({"seq": raw, "error": "序号不是整数"})
+            continue
+        ref, problem = _board_ref(ctx, number)
+        snapshots.append(_done_state(ctx, number, ref, problem))
+    return snapshots
+
+
+def _done_state(ctx: Context, number: int, ref: str | None, problem: str | None) -> dict:
+    """一条 done 的 before 快照（号不对就只留原因）。"""
+    if problem or ref is None:
+        return {"seq": number, "error": problem}
+    kind, _, target = ref.partition(":")
+    if kind == INBOX_LIST_LABEL:
+        row = ctx.inbox.get(int(target))
+        return {"seq": number, "ref": ref, "moved": bool(row and row["moved_at"])}
+    item = _reminder_item(ctx, target)
+    return {"seq": number, "ref": ref,
+            "completed": bool(item.get("isCompleted")) if item else None}
 
 
 def _done_one(ctx: Context, raw) -> dict:

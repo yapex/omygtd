@@ -241,6 +241,13 @@ class Inbox(_LocalTable):
             "WHERE moved_at IS NULL ORDER BY id ASC").fetchall()
         return [dict(row) for row in rows]
 
+    def get(self, row_id) -> dict | None:
+        """按行 id 读一条**含已迁出**的念头：审计要真值，不拿回执猜。"""
+        row = self._db().execute(
+            "SELECT id, title, note, created_at, moved_at, reminder_id, priority FROM inbox "
+            "WHERE id = ?", (row_id,)).fetchone()
+        return dict(row) if row else None
+
     def set_priority(self, inbox_id, value, *, now=None) -> bool:
         """改一条未迁出念头的优先级；已迁出（或没有这一行）返回 False。"""
         cur = self._db().execute(
