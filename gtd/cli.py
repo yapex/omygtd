@@ -86,8 +86,10 @@ def _context(args, store, now) -> Context:
 
 
 def _write(payload: dict, human: bool, command: str = "") -> None:
-    text = _human(command, payload) if human else json.dumps(payload, ensure_ascii=False,
-                                                             indent=2)
+    text = payload.get("text")            # view：渲染好的文字直接铺出去，不套 JSON
+    if text is None:
+        text = _human(command, payload) if human else json.dumps(payload, ensure_ascii=False,
+                                                                 indent=2)
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
 
 
@@ -307,6 +309,38 @@ def _pending_row(ctx: Context, number: int) -> dict | None:
     return next((row for row in pending if row["id"] == number), None)
 
 
+# ---------------------------------------------------------------- 视图数据装配
+
+@dataclass
+class TodayView:
+    """一次「看板/文字视图」的装配结果：Reminder 全量、图上条目、当天固定号。
+
+    ``items`` 是 GTD/Waiting 未完成的全部条目（镜像要全量）；``entries`` 是图上/表上
+    会出现的条目（``number`` 已按 ``board_index`` 填好）；``order`` 是图上从上到下的
+    顺序（今日 → 接下来 → 收件箱），``numbers`` 是这条顺序上每条的号。
+    """
+
+    items: list
+    entries: list
+    order: list
+    numbers: dict
+
+
+def _today_view(ctx: Context) -> TodayView:
+    """读 Reminder → 组 Entry → 分区 → 分配当天图上号。board 与 view 共用这一份。
+
+    两个命令的号之所以一定一致，就是因为装配只此一处：谁先跑谁写 ``board_index``，
+    后跑的读到同一批号（当天幂等）。
+    """
+    items = _open_items(ctx)                    # 出图与镜像共用这一份，不读两遍
+    entries = _today_tasks(ctx, items) + _inbox_entries(ctx)
+    order = render.board_order(entries, now=ctx.now)      # 图上从上到下
+    numbers = _board_numbers(ctx, order)                 # 引用 → 当天固定的图上号
+    numbered = [replace(entry, number=numbers.get(entry.ref, entry.number))
+                for entry in entries]     # 没上图（超过 5 条）的条目不会印出来
+    return TodayView(items=items, entries=numbered, order=order, numbers=numbers)
+
+
 # ---------------------------------------------------------------- board
 
 def cmd_board(ctx: Context, args) -> Result:
@@ -317,34 +351,48 @@ def cmd_board(ctx: Context, args) -> Result:
     连出多少次图，号一个字都不变；`done N` 就能一直指到同一条。
 
     出图**成功之后**才写：整表重建 mirror（``drift`` 于是变成「上次出图以后
-    Reminder 被改过」的信号）＋ 图上号映射。顺序不能反：出图失败就不写，
+    Reminder 被改过」的信号）＋图上号映射。顺序不能反：出图失败就不写，
     否则会记下一个用户根本没看到的视图。两处写失败只进 ``warnings``，board 仍成功。
 
     默认落两个文件：唯一名 ``out/board-YYYYMMDD-HHMMSS.png``（``path``，推送用
     它绕开客户端按路径缓存）＋当天最新副本 ``out/today-YYYYMMDD.png``（``latest``，
     供 cron / 人直接引用）。``--out`` 显式给了就只写那一个，``latest`` 为 None。
     """
-    items = _open_items(ctx)                    # 出图与镜像共用这一份，不读两遍
-    loose = _inbox_entries(ctx)
-    entries = _today_tasks(ctx, items) + loose
-    order = render.board_order(entries, now=ctx.now)      # 图上从上到下
-    numbers = _board_numbers(ctx, order)                 # 引用 → 当天固定的图上号
-    numbered = [replace(entry, number=numbers.get(entry.ref, entry.number))
-                for entry in entries]     # 没上图（超过 5 条）的条目不会印出来
+    view = _today_view(ctx)
     explicit = Path(args.out).expanduser() if args.out else None
     out = explicit or _unique_out(datetime.now())      # 时刻取本地墙钟，不是 UTC
     out.parent.mkdir(parents=True, exist_ok=True)
-    path = render.render_today(numbered, now=ctx.now, out_path=out)
+    path = render.render_today(view.entries, now=ctx.now, out_path=out)
     latest = None if explicit else _default_out(ctx.today)
     if latest is not None:                     # 实体副本（copy2），不用软链
         latest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, latest)
     payload = {"ok": True, "path": str(path), "latest": str(latest) if latest else None,
-               "count": len(order),
-               "overdue": sum(1 for entry in order if entry.overdue_days > 0),
-               "inbox": sum(1 for entry in order if entry.kind == "inbox"),
-               "numbers": [numbers[entry.ref] for entry in order]}
-    warnings = _persist_board(ctx, items, numbers)
+               "count": len(view.order),
+               "overdue": sum(1 for entry in view.order if entry.overdue_days > 0),
+               "inbox": sum(1 for entry in view.order if entry.kind == "inbox"),
+               "numbers": [view.numbers[entry.ref] for entry in view.order]}
+    warnings = _persist_board(ctx, view.items, view.numbers)
+    if warnings:
+        payload["warnings"] = warnings
+    return Result(payload)
+
+
+# ---------------------------------------------------------------- view
+
+def cmd_view(ctx: Context, args) -> Result:
+    """全库文字视图：Markdown（默认，手机上看）或 JSON（脚本用）。
+
+    与 ``board`` 同一份装配（``_today_view``），所以同一数据状态下两边的号一模一样；
+    成功后同样增量写 ``board_index``（幂等规则不变）——「看了文字说 2 号完成」也能定位。
+    渲染文本放在 ``text`` 里，``_write`` 直接铺到 stdout（不再套一层 JSON）。
+    """
+    view = _today_view(ctx)
+    fmt = getattr(args, "format", "md") or "md"
+    payload = {"ok": True, "format": fmt, "count": len(view.order),
+               "numbers": [view.numbers[entry.ref] for entry in view.order],
+               "text": render.render_view(view.entries, now=ctx.now, fmt=fmt)}
+    warnings = _persist_board(ctx, view.items, view.numbers)
     if warnings:
         payload["warnings"] = warnings
     return Result(payload)
@@ -543,6 +591,8 @@ def _human(command: str, payload: dict) -> str:
         return _human_inbox(payload)
     if command == "board":
         return f"✓ {payload['count']} 条 → {payload['path']}"
+    if command == "list":
+        return _human_list(payload)
     if command == "done":
         return _human_done(payload)
     return json.dumps(payload, ensure_ascii=False)
@@ -563,6 +613,21 @@ def _human_inbox(payload: dict) -> str:
     lines += [f"{item['id']}. {item['title']}（{item['age_days']} 天）"
               for item in payload["items"]]
     return "\n".join(lines)
+
+
+def _display_width(text: str) -> int:
+    """终端显示宽度：全角字符（汉字）占两格，中文列表名才对得齐。"""
+    return sum(2 if ord(ch) > 127 else 1 for ch in text)
+
+
+def _human_list(payload: dict) -> str:
+    """``--human list``：每个列表一行「名字  总数 条（未完成数）」，不给 JSON。"""
+    lists = payload.get("lists") or []
+    if not lists:
+        return "Reminder 里一个列表都没有"
+    width = max(_display_width(row["name"]) for row in lists)
+    return "\n".join(f"{row['name']}{' ' * (width - _display_width(row['name']) + 2)}"
+                     f"{row['total']} 条（{row['open']} 未完成）" for row in lists)
 
 
 def _human_done(payload: dict) -> str:
@@ -587,7 +652,7 @@ def _human_doctor(payload: dict) -> str:
 # ---------------------------------------------------------------- 参数定义
 
 DISPATCH = {"add": cmd_add, "inbox": cmd_inbox, "clarify": cmd_clarify,
-            "board": cmd_board, "done": cmd_done, "list": cmd_list,
+            "board": cmd_board, "view": cmd_view, "done": cmd_done, "list": cmd_list,
             "doctor": cmd_doctor}
 
 
@@ -601,7 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="钉住当前时刻（测试用），如 '2026-11-23 09:00'")
     parser.add_argument("--human", action="store_true", help="给人看的文字输出（默认 JSON）")
     sub = parser.add_subparsers(dest="command", required=True)
-    for builder in (_add, _inbox, _clarify, _board, _done, _list, _doctor):
+    for builder in (_add, _inbox, _clarify, _board, _view, _done, _list, _doctor):
         builder(sub)
     return parser
 
@@ -628,6 +693,12 @@ def _board(sub) -> None:
     p.add_argument("--out", metavar="PATH",
                    help="只写这一个路径；不给就落 out/board-YYYYMMDD-HHMMSS.png "
                         "＋ out/today-YYYYMMDD.png（当天最新副本）")
+
+
+def _view(sub) -> None:
+    p = sub.add_parser("view", help="全库文字视图：Markdown（默认）或 JSON，编号与 board 一致")
+    p.add_argument("--format", choices=render.view_formats(), default="md",
+                   help="md（默认，手机上直接看）/ json（脚本用）")
 
 
 def _done(sub) -> None:

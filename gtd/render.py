@@ -920,6 +920,114 @@ def render_today(entries: list[Entry], *, now: datetime, out_path: Path) -> Path
     return out
 
 
+# ---------------------------------------------------------------- v2 文字视图（Markdown / JSON）
+#
+# 与 `render_today` 同一份数据装配：三区（今天 → 接下来 → 收件箱）、同一套图上号。
+# 区别只在最后一公里——图是 PNG，文字是 Markdown（手机能直接看）或 JSON（脚本用）。
+
+MD_NEXT_LABEL = "**接下来**"
+MD_INBOX_LABEL = "**收件箱**"
+
+
+def _counts(entries: list[Entry], today: date) -> dict[str, int]:
+    """顶栏三个数，与图上「今天 N 件 · 逾期 M 件 · 收件箱 K 条」**同一口径**。
+
+    注意「今天」按图上的算法包含收件箱行（图上顶栏就是这么数的），别在这里
+    自作聪明改成只数任务——两个视图的数必须对得上。
+    """
+    todays = [entry for entry in entries if not _future(entry, today)]
+    return {"today": len(todays),
+            "overdue": sum(1 for entry in todays if entry.overdue_days > 0),
+            "inbox": sum(1 for entry in entries if entry.kind == "inbox")}
+
+
+def _md_summary(entries: list[Entry], today: date) -> str:
+    counts = _counts(entries, today)
+    return (f"**今天 {counts['today']} 件 · 逾期 {counts['overdue']} 件 · "
+            f"收件箱 {counts['inbox']} 条**")
+
+
+def _md_title(entry: Entry) -> str:
+    """标题单元格：逾期条目在标题后加「（逾期 N 天）」。"""
+    if entry.overdue_days <= 0:
+        return entry.title
+    return f"{entry.title}（逾期 {entry.overdue_days} 天）"
+
+
+def _md_cell(value) -> str:
+    """表格单元格：竖线必须转义（否则把表格劈开），换行压成空格。"""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _md_table(head: tuple[str, ...], rows: list[tuple]) -> str:
+    """第一列恒为图上号 ``#``，其余列按 ``head``；行里的竖线统一转义。"""
+    cols = ("#", *head)
+    lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    lines += ["| " + " | ".join(_md_cell(cell) for cell in row) + " |" for row in rows]
+    return "\n".join(lines)
+
+
+def _md_next_block(shown: list[Entry], total: int) -> str:
+    """「接下来」区：前 5 条上表，多出来的只报一句「还有 N 条」（与图上一致）。"""
+    rows = [(str(entry.number), _next_when(entry), _md_title(entry), entry.list_name)
+            for entry in shown]
+    table = _md_table(("日期时刻", "标题", "列表"), rows)
+    extra = total - len(shown)
+    return f"{table}\n\n还有 {extra} 条" if extra > 0 else table
+
+
+def render_today_markdown(entries: list[Entry], *, now: datetime) -> str:
+    """全库 Markdown：今天 → 接下来 → 收件箱；空区整区不渲染。
+
+    编号由命令层按 ``board_index`` 填在 ``Entry.number``（与 ``board`` 出图同一套号），
+    这里只印不排。逾期条目标题后带「（逾期 N 天）」，全天/上午/下午沿用 ``_when_text``。
+    """
+    upper, shown, total, lower = _layout(entries, now.date())
+    blocks = [_md_summary(entries, now.date())]
+    if upper:
+        rows = [(str(entry.number), _when_text(entry), _md_title(entry), entry.list_name)
+                for entry in upper]
+        blocks.append(_md_table(("时刻", "标题", "列表"), rows))
+    if shown:
+        blocks.append(f"{MD_NEXT_LABEL}\n\n{_md_next_block(shown, total)}")
+    if lower:
+        rows = [(str(entry.number), entry.title) for entry in lower]
+        blocks.append(f"{MD_INBOX_LABEL}\n\n{_md_table(('标题',), rows)}")
+    return "\n\n".join(blocks) + "\n"
+
+
+def _view_item(entry: Entry, when: str) -> dict:
+    return {"number": entry.number, "when": when, "title": entry.title,
+            "list": entry.list_name, "overdue_days": entry.overdue_days}
+
+
+def render_today_json(entries: list[Entry], *, now: datetime) -> str:
+    """结构化文字视图：三区条目 + 每条的号/时刻/标题/列表/逾期天数。"""
+    upper, shown, total, lower = _layout(entries, now.date())
+    payload = {"summary": _counts(entries, now.date()), "next_total": total,
+               "today": [_view_item(e, _when_text(e)) for e in upper],
+               "next": [_view_item(e, _next_when(e)) for e in shown],
+               "inbox": [_view_item(e, "") for e in lower]}
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+VIEW_RENDERERS = {"md": render_today_markdown, "json": render_today_json}
+
+
+def view_formats() -> tuple[str, ...]:
+    """文字视图可选的格式名（命令层据此给 argparse choices，不写死分支）。"""
+    return tuple(sorted(VIEW_RENDERERS))
+
+
+def render_view(entries: list[Entry], *, now: datetime, fmt: str = "md") -> str:
+    """按格式渲染文字视图（``md`` 默认 / ``json``）；未知格式抛 ValueError。"""
+    try:
+        renderer = VIEW_RENDERERS[fmt]
+    except KeyError as exc:
+        raise ValueError(f"未知格式：{fmt}（可选：{'/'.join(view_formats())}）") from exc
+    return renderer(entries, now=now)
+
+
 def _write_temp_html(page: str, folder: Path) -> Path:
     handle, name = tempfile.mkstemp(prefix=".gtd-today-", suffix=".html", dir=folder)
     with os.fdopen(handle, "w", encoding="utf-8") as stream:

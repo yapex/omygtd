@@ -662,3 +662,80 @@ def test_board_does_not_turn_all_day_midnight_into_a_clock(capsys, db, fake,
     assert by_title["买菜"].at is None and by_title["买菜"].all_day is True
     assert by_title["买菜"].alarm is None
     assert by_title["取快递"].at is None and by_title["取快递"].alarm == time(18, 0)
+
+
+# ---------------------------------------------------------------- view（文字视图）
+#
+# 老板要「改完 GTD 回 Markdown 文字，别再出图」（出图要 Chrome，2–3 秒）。
+# 硬要求：view 与 board 的号必须一致（两边共用 _today_view + board_index 当天幂等），
+# 且 view 也要写 board_index，否则「看了文字说 2 号完成」没法定位。
+
+def run_text(capsys, argv, *, db, store, now=NOW):
+    """跑一次 cli.main，返回 (退出码, 原始 stdout)——view 输出是 Markdown，不是 JSON。"""
+    code = cli.main(["--db", str(db), "--now", now, *argv], store=store)
+    return code, capsys.readouterr().out
+
+
+def md_numbers(text):
+    """Markdown 表格里的号（数据行第一列）。"""
+    return [int(match) for match in re.findall(r"^\| (\d+) \|", text, flags=re.M)]
+
+
+def test_view_numbers_match_board_numbers(capsys, db, fake, tmp_path, monkeypatch):
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), "GTD")
+    fake.add("把小米 SU7 送 4S 店保养", datetime(2026, 11, 27, 16, 0), "GTD")
+    run(capsys, ["add", "想到一个点子"], db=db, store=fake)          # 收件箱一条
+    code, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert code == 0 and "**今天" in text
+    monkeypatch.setattr(cli.render, "render_today", stub_render())
+    board = run(capsys, ["board", "--out", str(tmp_path / "b.png")], db=db, store=fake)[1]
+    assert md_numbers(text) == board["numbers"] == [1, 2, 3, 4]
+
+
+def test_view_writes_board_index_so_done_still_works(capsys, db, fake):
+    """只看了 Markdown（没出图）也能按号完成——view 成功后就写了 board_index。"""
+    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
+    code, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert code == 0 and md_numbers(text) == [1]
+    assert board_rows(db) == [(1, f"reminder:{added['reminder_id']}")]
+    code, data = run(capsys, ["done", "1"], db=db, store=fake)
+    assert code == 0 and data["results"][0]["ok"] is True
+    assert fake.all()[0]["isCompleted"] is True
+
+
+def test_view_json_format_returns_structured_data(capsys, db, fake):
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    run(capsys, ["add", "想到一个点子"], db=db, store=fake)
+    code, text = run_text(capsys, ["view", "--format", "json"], db=db, store=fake)
+    data = json.loads(text)                      # 结构化，不是 Markdown
+    # 「今天」与图上顶栏同一口径（收件箱行也算在「今天」里）→ 2 件
+    assert code == 0 and data["summary"] == {"today": 2, "overdue": 0, "inbox": 1}
+    assert [item["number"] for item in data["today"]] == [1]
+    assert data["today"][0]["when"] == "12:00"
+    assert [item["title"] for item in data["inbox"]] == ["想到一个点子"]
+
+
+def test_view_empty_store_renders_summary_only(capsys, db, fake):
+    code, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert code == 0 and text.strip() == "**今天 0 件 · 逾期 0 件 · 收件箱 0 条**"
+    assert board_rows(db) == []
+
+
+def test_view_markdown_shows_overdue_tag_and_next_section(capsys, db, fake):
+    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), "GTD")
+    fake.add("买菜", datetime(2026, 11, 24), "GTD", all_day=True)
+    _, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert "（逾期 1 天）" in text and "**接下来**" in text
+    assert "周二 全天" in text
+
+
+def test_human_list_prints_text_not_json(capsys, db, fake):
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("买电池", datetime(2026, 11, 23, 20, 0), "GTD")
+    fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), "Waiting")
+    code, text = run_text(capsys, ["--human", "list"], db=db, store=fake)
+    assert code == 0 and not text.lstrip().startswith("{")
+    assert "GTD" in text and "2 条（2 未完成）" in text
+    assert "Waiting" in text and "1 条（1 未完成）" in text
+

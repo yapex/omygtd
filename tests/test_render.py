@@ -8,13 +8,15 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, time, timedelta
 
 import pytest
 
 from gtd.render import (Entry, _find_chrome, _png_size, board_order, build_today_html,
-                        render_today)
+                        render_today, render_today_json, render_today_markdown,
+                        render_view, view_formats)
 
 NOW = datetime(2026, 11, 23, 21, 40)          # 周一晚上 21:40
 
@@ -357,3 +359,101 @@ def test_render_today_writes_png(tmp_path):
     assert width == 2160, "宽 1080 @2x"
     assert height > 400
     assert list(tmp_path.glob("*.html")) == [], "临时 HTML 必须删掉"
+
+
+# ---------- 13. 文字视图（Markdown / JSON，t_f85d8c13） ----------
+#
+# 与 board 图同一份分区、同一套号：编号由命令层给（Entry.number），这里只印不排。
+# 空区整区不渲染；逾期在标题后加「（逾期 N 天）」；全天/上午/下午沿用图上同一个词。
+
+def md(entries):
+    return render_today_markdown(entries, now=NOW)
+
+
+def md_rows(text: str) -> list[str]:
+    """表格数据行（去掉表头与分隔行）。"""
+    return [line for line in text.splitlines()
+            if line.startswith("| ") and not line.startswith("| # |")]
+
+
+def test_markdown_today_row_has_number_clock_title_list():
+    text = md([entry("卖出 ≥550 股 SCHO", number=1, at=time(22, 30))])
+    assert "**今天 1 件 · 逾期 0 件 · 收件箱 0 条**" in text
+    assert "| # | 时刻 | 标题 | 列表 |" in text
+    assert "| 1 | 22:30 | 卖出 ≥550 股 SCHO | GTD |" in text
+
+
+def test_markdown_next_section_carries_weekday_and_clock():
+    text = md([later("把小米 SU7 送 4S 店保养", days=4, number=3, at=time(16, 0))])
+    assert "**接下来**" in text
+    assert "| # | 日期时刻 | 标题 | 列表 |" in text
+    assert "| 3 | 周五 16:00 | 把小米 SU7 送 4S 店保养 | GTD |" in text
+
+
+def test_markdown_all_day_morning_afternoon_words():
+    text = md([all_day("买菜", number=1),
+               all_day("取快递", number=2, alarm=time(12, 0)),
+               all_day("开会", number=3, alarm=time(18, 0))])
+    clocks = [row.split(" | ")[1] for row in md_rows(text)]
+    assert clocks == ["全天", "上午", "下午"], clocks
+
+
+def test_markdown_overdue_appends_days_to_title():
+    text = md([entry("昨天该做完的", number=2, at=time(18, 0), overdue_days=2)])
+    assert "| 2 | 18:00 | 昨天该做完的（逾期 2 天） | GTD |" in text
+
+
+def test_markdown_empty_sections_are_not_rendered():
+    """只有收件箱一条：不出现「接下来」标题、不出现时刻表；今天表也不渲染。"""
+    text = md([entry("想到一个点子", number=1, kind="inbox")])
+    assert "**接下来**" not in text
+    assert "| # | 时刻 | 标题 | 列表 |" not in text
+    assert "**收件箱**" in text
+    assert "| 1 | 想到一个点子 |" in text
+
+
+def test_markdown_empty_store_shows_summary_only():
+    assert md([]) == "**今天 0 件 · 逾期 0 件 · 收件箱 0 条**\n"
+
+
+
+def test_markdown_numbers_print_as_given_and_are_not_renumbered():
+    """图上号是 board_index 给的：今天 4 号、接下来 9 号，原样印出来。"""
+    text = md([entry("甲", number=4, at=time(9, 0)),
+               later("乙", days=1, number=9, at=time(10, 0))])
+    assert [row.split(" | ")[0] for row in md_rows(text)] == ["| 4", "| 9"]
+
+
+def test_markdown_next_folds_after_five_with_count():
+    rows = [later(f"第{day}天", days=day, number=day + 1, at=time(9, 0)) for day in range(1, 7)]
+    text = md(rows)
+    assert len(md_rows(text)) == 5
+    assert "还有 1 条" in text
+
+
+def test_markdown_escapes_pipes_in_titles():
+    text = md([entry("A | B", number=1, at=time(9, 0))])
+    assert r"A \| B" in text and r"| 1 | 09:00 | A \| B | GTD |" in text
+
+
+def test_json_view_is_structured_with_numbers():
+    text = render_today_json([entry("甲", number=1, at=time(22, 30)),
+                              entry("想到一个点子", number=2, kind="inbox")], now=NOW)
+    data = json.loads(text)
+    # 「今天」与图上顶栏同一口径：收件箱行也算在里面，所以是 2 件
+    assert data["summary"] == {"today": 2, "overdue": 0, "inbox": 1}
+    assert [item["number"] for item in data["today"]] == [1]
+    assert data["today"][0]["when"] == "22:30"
+    assert [item["title"] for item in data["inbox"]] == ["想到一个点子"]
+
+
+def test_view_formats_are_md_and_json():
+    assert view_formats() == ("json", "md")
+    assert render_view([], now=NOW) == render_today_markdown([], now=NOW)
+    assert json.loads(render_view([], now=NOW, fmt="json"))["summary"] == {
+        "today": 0, "overdue": 0, "inbox": 0}
+
+
+def test_render_view_rejects_unknown_format():
+    with pytest.raises(ValueError, match="未知格式"):
+        render_view([], now=NOW, fmt="xml")
