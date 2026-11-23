@@ -22,10 +22,11 @@ def p(text, now=NOW):
 # ---------- 1-11：日期 / 时刻主体 ----------
 
 def test_today_vegetables():
-    """今天买菜 → due=今天, at=22:30, 标题抠干净。"""
+    """今天买菜 → due=今天、没有钟点 → 全天（t_0541f6c3 起不再兜底 22:30）。"""
     got = p("今天买菜")
     assert got.due == TODAY
-    assert got.at == time(22, 30)
+    assert got.at is None and got.slot is None
+    assert got.all_day is True
     assert got.title == "买菜"
 
 
@@ -38,10 +39,11 @@ def test_tomorrow_noon_before():
 
 
 def test_day_after_tomorrow_morning():
-    """后天上午开会 → 上午 = 12:00 截止点。"""
+    """后天上午开会 → 上午 = 全天 + 12:00 响（slot=am，不产时刻）。"""
     got = p("后天上午开会")
     assert got.due == date(2026, 11, 25)
-    assert got.at == time(12, 0)
+    assert got.at is None and got.slot == "am"
+    assert got.all_day is False
     assert got.title == "开会"
 
 
@@ -169,9 +171,9 @@ def test_duplicate_date():
 
 
 def test_duplicate_period():
-    """下午下午 → at 取最后一个 18:00，标题空。"""
+    """下午下午 → 只记一个时段（slot=pm，不产时刻），标题空。"""
     got = p("下午下午")
-    assert got.at == time(18, 0)
+    assert got.at is None and got.slot == "pm"
     assert got.title == ""
 
 
@@ -386,13 +388,13 @@ def test_interior_time_is_not_stripped():
 # 事故：上一条只锁了 title，没锁 at。`明天中午前交材料，顺便看看 3 点的会`
 #      标题是对的，at 却被正文里的「3 点」抢成 15:00（应为中午前 12:00）。
 # 口径：时刻只认**句首时间前缀**里的最后一个；正文中间的时间既不剥、也不算。
-#      前缀只给日期不给钟点 → 当天 22:30（全天截止）。
+#      前缀只给日期不给钟点 → 没有钟点（全天），不再兜底 22:30（t_0541f6c3）。
 
 INTERIOR_TIME = [
     ("明天中午前交材料，顺便看看 3 点的会", "交材料，顺便看看 3 点的会",
      date(2026, 11, 24), time(12, 0)),
     ("明天买材料 下午 3 点开会", "买材料 下午 3 点开会",
-     date(2026, 11, 24), time(22, 30)),
+     date(2026, 11, 24), None),
     ("今天晚上 10 点半美股开盘后，提醒我卖出 SCHO", "美股开盘后，提醒我卖出 SCHO",
      TODAY, time(22, 30)),
     ("后天下午 3 点半开会，记得带电脑", "开会，记得带电脑",
@@ -412,9 +414,9 @@ def test_interior_time_does_not_win_the_clock(text, title, due, at):
 
 
 def test_prefix_date_only_falls_back_to_all_day_cutoff():
-    """前缀只有日期、没有钟点 → at=22:30（全天截止），不是正文钟点。"""
+    """前缀只有日期、没有钟点 → 全天（at=None），不是正文钟点、也不再是 22:30。"""
     got = p("明天买材料 下午 3 点开会")
-    assert got.at == time(22, 30)
+    assert got.at is None and got.all_day is True
     assert got.matched == "明天 下午 3 点"      # matched 仍回显全句时间原文，便于调试
 
 
@@ -429,5 +431,57 @@ def test_prefix_date_plus_inner_clock_keeps_prefix_clock():
     got = p("明天中午前交材料，3 点开会")
     assert got.at == time(12, 0)
     assert got.title == "交材料，3 点开会"
+
+
+# ---------- 69+：due 全天 + alarm 时刻（t_0541f6c3） ----------
+#
+# Reminder 的 due 与 alarm 是两件事：due 给全天（整天挂锁屏）、alarm 到点响一次。
+# 「没钟点」不再是 22:30；上午 / 下午 只记时段标记；钟点仍然赢过时段词。
+
+def test_date_only_is_all_day():
+    """明天 买菜 → 全天（at=None、slot=None），不再是 22:30。"""
+    got = p("明天 买菜")
+    assert got.due == date(2026, 11, 24)
+    assert got.at is None and got.slot is None
+    assert got.all_day is True and got.title == "买菜"
+
+
+def test_morning_slot_is_not_a_clock():
+    """明天上午买菜 → slot=am（due 全天 + 12:00 响），不产具体时刻。"""
+    got = p("明天上午买菜")
+    assert got.due == date(2026, 11, 24)
+    assert got.at is None and got.slot == "am"
+    assert got.all_day is False
+
+
+def test_afternoon_slot_is_not_a_clock():
+    """明天下午买菜 → slot=pm（due 全天 + 18:00 响）。"""
+    got = p("明天下午买菜")
+    assert got.due == date(2026, 11, 24)
+    assert got.at is None and got.slot == "pm"
+
+
+def test_slot_without_date_is_not_all_day():
+    """只说「下午」没说哪天 → 没有 due，就不是全天（CLI 落今天 + 18:00 响）。"""
+    got = p("下午交材料")
+    assert got.due is None and got.slot == "pm" and got.all_day is False
+
+
+def test_noon_before_stays_a_precise_time():
+    """中午前仍是精确 12:00（截止点），不退化成全天。"""
+    got = p("明天中午前交材料")
+    assert got.at == time(12, 0) and got.slot is None and got.all_day is False
+
+
+def test_evening_clock_stays_precise():
+    """今晚 22:30 卖出 → 精确 22:30（钟点赢过「晚上」这个时段词）。"""
+    got = p("今晚 22:30 卖出")
+    assert got.at == time(22, 30) and got.slot is None and got.all_day is False
+
+
+def test_clock_beats_period_word():
+    """明天下午 3 点开会 → 15:00 精确时刻，不许退成 slot=pm。"""
+    got = p("明天下午 3 点开会")
+    assert got.at == time(15, 0) and got.slot is None and got.all_day is False
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 
 import pytest
@@ -153,7 +153,8 @@ def test_clarify_marks_inbox_row_moved(capsys, db, fake):
     code, data = run(capsys, ["clarify", str(inbox_id), "明天下午"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["title"] == "回设计稿"                  # 只说了时间，标题沿用 inbox 的
-    assert data["due"] == "2026-11-24" and data["at"] == "18:00"
+    # 下午 = 全天 + 18:00 响（t_0541f6c3）：at 不再报 18:00，改报 slot
+    assert data["due"] == "2026-11-24" and data["at"] is None and data["slot"] == "pm"
     assert data["list"] == "GTD" and data["inbox_id"] == inbox_id
     assert Inbox(db).pending() == []
     moved = rows(db, "select moved_at, reminder_id from inbox where id=?", inbox_id)[0]
@@ -582,6 +583,15 @@ def test_human_output_is_not_json(capsys, db, fake):
     assert out == "✓ #1 交材料 · 2026-11-24 12:00"
 
 
+def test_human_output_names_all_day_and_slots(capsys, db, fake):
+    """--human 回执用「全天 / 上午 / 下午」同一个词，不印 00:00。"""
+    for text, expected in (("明天 买菜", "· 2026-11-24 全天"),
+                           ("明天上午买菜", "· 2026-11-24 上午"),
+                           ("明天下午买菜", "· 2026-11-24 下午")):
+        cli.main(["--db", str(db), "--now", NOW, "--human", "add", text], store=fake)
+        assert capsys.readouterr().out.strip().endswith(expected), text
+
+
 def test_list_counts_per_list(capsys, db, fake):
     fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
     fake.add("买电池", datetime(2026, 11, 23, 20, 0), "GTD")
@@ -590,3 +600,65 @@ def test_list_counts_per_list(capsys, db, fake):
     assert code == 0 and data["ok"] is True
     assert data["lists"] == [{"name": "GTD", "total": 2, "open": 2},
                              {"name": "Waiting", "total": 1, "open": 1}]
+
+
+# ---------------------------------------------------------------- 全天 / 上午 / 下午
+# （t_0541f6c3：Reminder 的 due 与 alarm 独立 —— due 给全天，alarm 给精确时刻。）
+
+def test_add_date_only_lands_as_all_day(capsys, db, fake):
+    """只给日期 → Reminder 全天（due 不带时刻、无闹钟）。"""
+    code, data = run(capsys, ["add", "明天 买菜"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["due"] == "2026-11-24" and data["at"] is None
+    assert data["all_day"] is True and data["slot"] is None
+    (item,) = fake.all()
+    assert item["dueDate"] == "2026-11-24" and item["dueDateIsAllDay"] is True
+    assert item["alarmDate"] == ""
+
+
+def test_add_morning_slot_is_all_day_plus_noon_alarm(capsys, db, fake):
+    code, data = run(capsys, ["add", "明天上午买菜"], db=db, store=fake)
+    assert data["at"] is None and data["all_day"] is False and data["slot"] == "am"
+    (item,) = fake.all()
+    assert item["dueDate"] == "2026-11-24" and item["dueDateIsAllDay"] is True
+    assert item["alarmDate"] == "2026-11-24 12:00"
+
+
+def test_add_afternoon_slot_is_all_day_plus_evening_alarm(capsys, db, fake):
+    code, data = run(capsys, ["add", "后天下午开会"], db=db, store=fake)
+    assert data["slot"] == "pm" and data["due"] == "2026-11-25"
+    (item,) = fake.all()
+    assert item["dueDate"] == "2026-11-25" and item["dueDateIsAllDay"] is True
+    assert item["alarmDate"] == "2026-11-25 18:00"
+
+
+def test_add_precise_time_rings_at_that_moment(capsys, db, fake):
+    """今晚 22:30 → due 与 alarm 都是 22:30（到点响一次，不再是「没闹钟」）。"""
+    code, data = run(capsys, ["add", "今晚 22:30 卖出"], db=db, store=fake)
+    assert data["at"] == "22:30" and data["all_day"] is False and data["slot"] is None
+    (item,) = fake.all()
+    assert item["dueDate"] == "2026-11-23 22:30"
+    assert item["alarmDate"] == "2026-11-23 22:30"
+    assert item["dueDateIsAllDay"] is False
+
+
+def test_board_does_not_turn_all_day_midnight_into_a_clock(capsys, db, fake,
+                                                           tmp_path, monkeypatch):
+    """读路径：全天条目的 at 必须是 None（不许把本地 00:00 当时刻），闹钟另放。"""
+    fake.add("买菜", datetime(2026, 11, 23), "GTD", all_day=True)
+    fake.add("取快递", datetime(2026, 11, 23), "GTD", slot="pm")
+    seen = {}
+
+    def fake_render(entries, *, now, out_path):
+        seen["entries"] = entries
+        Path(out_path).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return Path(out_path)
+
+    monkeypatch.setattr(cli.render, "render_today", fake_render)
+    code, _data = run(capsys, ["board", "--out", str(tmp_path / "x.png")],
+                      db=db, store=fake)
+    assert code == 0
+    by_title = {entry.title: entry for entry in seen["entries"]}
+    assert by_title["买菜"].at is None and by_title["买菜"].all_day is True
+    assert by_title["买菜"].alarm is None
+    assert by_title["取快递"].at is None and by_title["取快递"].alarm == time(18, 0)

@@ -694,6 +694,9 @@ NEXT_DAYS = 7                    # 未来 7 天以内（含第 7 天）才进「
 T_WHEN_W = T_SEQ_W + T_AT_W      # 200：「号 + 周五 15:30」正好占序号 + 时刻两列
 T_NEXT_LABEL_H = 40
 T_MORE_H = 34
+ALL_DAY_LABEL = "全天"
+# 时段闹钟回显成老板说出口的那个词：146px 的 nowrap 列放不下「全天 · 12:00 响」
+ALARM_LABELS = {time(12, 0): "上午", time(18, 0): "下午"}
 
 
 @dataclass(frozen=True)
@@ -714,6 +717,8 @@ class Entry:
     kind: str = "task"                # task | inbox
     due: date | None = None           # 这条属于哪天；渲染层据此分「今日」与「接下来」
     ref: str = ""                     # reminder:<id> / inbox:<id>，给 board_index 用
+    all_day: bool = False             # Reminder 里的全天条目（at 必为 None）
+    alarm: time | None = None         # 全天的闹钟时刻（「12:00 响」），仅用于回显
 
 
 def _future(entry: Entry, today: date) -> bool:
@@ -751,12 +756,25 @@ def _next_pick(entries: list[Entry], today: date):
     return items[:NEXT_LIMIT], len(items)
 
 
+def _when_text(entry: Entry) -> str:
+    """时刻列的文字：具体时刻 ``HH:MM``；全天 → ``全天`` / ``上午`` / ``下午``。
+
+    ``all_day`` 有闹钟时用老板说的时段词回显（12:00→上午、18:00→下午），
+    非约定时刻退成「全天 09:30」，不拿一个不存在的时段去糊。
+    """
+    if entry.at is not None:
+        return entry.at.strftime("%H:%M")
+    if not entry.all_day:
+        return ""
+    if entry.alarm is None:
+        return ALL_DAY_LABEL
+    return ALARM_LABELS.get(entry.alarm, f"{ALL_DAY_LABEL} {entry.alarm.strftime('%H:%M')}")
+
+
 def _next_when(entry: Entry) -> str:
-    """日期前缀「周五 15:30」：一眼看出是哪天；无时刻只写星期。"""
+    """日期前缀「周五 15:30」：一眼看出是哪天；全天写「周五 全天」。"""
     label = WEEKDAY_CN[entry.due.weekday()] if entry.due else ""
-    if entry.at is None:
-        return label
-    return f"{label} {entry.at.strftime('%H:%M')}".strip()
+    return f"{label} {_when_text(entry)}".strip()
 
 
 def _next_row(entry: Entry) -> str:
@@ -792,12 +810,19 @@ def _top_bar_html(entries: list[Entry], today: date) -> str:
 
 
 def _at_html(entry: Entry, now: datetime) -> str:
-    """时刻列：inbox / 无 at 留空；at 早于 now（未完成）显示红褐色 #b4472e。"""
-    if entry.kind == "inbox" or entry.at is None:
+    """时刻列：inbox / 无时刻留空；早于 now（未完成）显示红褐色 #b4472e。
+
+    全天条目永远不上红色：它不是逾期，只是「整天挂着」，用比普通时刻更淡的灰。
+    """
+    if entry.kind == "inbox":          # 收件箱的念头没有时间，绝不印时刻
         return '<div class="at"></div>'
-    text = entry.at.strftime("%H:%M")
-    return (f'<div class="at past">{text}</div>' if entry.at < now.time()
-            else f'<div class="at">{text}</div>')
+    text = _when_text(entry)
+    if not text:
+        return '<div class="at"></div>'
+    if entry.all_day or entry.at is None:
+        return f'<div class="at allday">{text}</div>'
+    css = "at past" if entry.at < now.time() else "at"
+    return f'<div class="{css}">{text}</div>'
 
 
 def _tag_html(entry: Entry) -> str:
@@ -977,6 +1002,7 @@ TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
   .at { width: 146px; flex: none; font-size: 26px; color: #6b6259;
         font-variant-numeric: tabular-nums; }
   .at.past { color: #b4472e; }
+  .at.allday { color: #8a8078; }
   .title { flex: 1; font-size: 31px; line-height: 1.4; }
   .tag { flex: none; margin-left: 14px; font-size: 20px; color: #b4472e;
          background: #f4ded6; border-radius: 6px; padding: 3px 10px; }

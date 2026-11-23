@@ -271,3 +271,68 @@ def test_real_read_write_roundtrip_is_self_consistent(real_list):
     (item,) = [row for row in adapter.pending(real_list) if row["id"] == rid]
     assert item["dueDate"] == due.strftime("%Y-%m-%d %H:%M")
     assert item["alarmDate"] == (due - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M")
+
+
+# ---------- 24+：全天 / 时段（t_0541f6c3） ----------
+#
+# 实测真机：remindctl add --due "2026-11-24" --alarm "2026-11-24 12:00"
+#   → dueDateIsAllDay: true、alarmDate 仍是那一刻（due 与 alarm 独立，可组合）。
+
+def _add_args(monkeypatch, title="买菜", **kwargs):
+    """跑一次 adapter.add（不发真子进程），返回传给 remindctl 的参数表。"""
+    adapter = RemindctlAdapter()
+    seen = {}
+
+    def fake_run(args):
+        seen["args"] = args
+        return _Proc(json.dumps({"id": "UUID-1", "isCompleted": False}))
+
+    monkeypatch.setattr(adapter, "_run", fake_run)
+    adapter.add(title, NOW, TEST_LIST, **kwargs)
+    return seen["args"]
+
+
+def test_adapter_all_day_sends_date_only(monkeypatch):
+    """全天：--due 只给日期，绝不传时刻、也不带 --alarm。"""
+    args = _add_args(monkeypatch, all_day=True)
+    assert args[args.index("--due") + 1] == "2026-11-24"
+    assert "--alarm" not in args
+
+
+def test_adapter_morning_slot_rings_at_noon(monkeypatch):
+    args = _add_args(monkeypatch, slot="am")
+    assert args[args.index("--due") + 1] == "2026-11-24"
+    assert args[args.index("--alarm") + 1] == "2026-11-24 12:00"
+
+
+def test_adapter_afternoon_slot_rings_at_six(monkeypatch):
+    args = _add_args(monkeypatch, slot="pm")
+    assert args[args.index("--due") + 1] == "2026-11-24"
+    assert args[args.index("--alarm") + 1] == "2026-11-24 18:00"
+
+
+def test_adapter_precise_time_rings_at_that_moment(monkeypatch):
+    """到点即响（advance=0）：due 与 alarm 都是那一刻。"""
+    args = _add_args(monkeypatch, advance_minutes=0)
+    assert args[args.index("--alarm") + 1] == "2026-11-24 10:00"
+
+
+def test_fake_all_day_item_has_flag_and_no_clock():
+    fake = FakeStore()
+    fake.add("买菜", NOW, TEST_LIST, all_day=True)
+    item = fake.all()[0]
+    assert item["all_day"] is True and item["dueDateIsAllDay"] is True
+    assert item["dueDate"] == "2026-11-24" and ":" not in item["dueDate"]
+    assert item["alarmDate"] == ""
+
+
+def test_read_path_all_day_with_alarm_keeps_local_alarm(monkeypatch):
+    """读路径：allDay=true → all_day=True、dueDate 只有日期；alarmDate 换成本地 12:00。"""
+    adapter = RemindctlAdapter()
+    record = _scho_record(dueDate="2026-11-23T16:00:00Z", dueDateIsAllDay=True,
+                          alarmDate="2026-11-24T04:00:00Z")
+    monkeypatch.setattr(adapter, "_run", lambda args: _Proc(json.dumps([record])))
+    item = adapter.all()[0]
+    assert item["all_day"] is True
+    assert item["dueDate"] == "2026-11-24"            # 本地日期，不退一天
+    assert item["alarmDate"] == "2026-11-24 12:00"    # 04:00Z = 本地 12:00

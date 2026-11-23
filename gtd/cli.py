@@ -32,10 +32,11 @@ from .reminders import RemindctlAdapter, ReminderStore
 
 EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
 LISTS = (nlp.LIST_DEFAULT, nlp.LIST_WAITING)
-FALLBACK_AT = nlp.DEFAULT_AT          # 只给了日期、没给时刻 → 当天 22:30 截止
 OUT_ENV = "GTD_OUT"
 STAMP_FMT = "%Y-%m-%d %H:%M"
 INBOX_LIST_LABEL = "inbox"
+SLOT_WORDS = {"am": "上午", "pm": "下午"}      # --human 回执用的时段词
+ALL_DAY_WORD = "全天"
 
 
 @dataclass
@@ -116,10 +117,21 @@ def _list_of(parsed) -> str:
 
 
 def _due_at(parsed, now: datetime) -> datetime | None:
-    """解析结果 → Reminder 的到期时刻；解析不出时间给 None。"""
+    """解析结果 → Reminder 的到期时刻；只有日期时落当天零点（全天由标记决定）。
+
+    全天 / 时段的「没有钟点」不是 22:30：`parsed.all_day` / `parsed.slot` 直接传给
+    存储层，这里只给日期占位。什么时间都没听出来 → None（进收件箱）。
+    """
     if parsed.due is None and parsed.at is None:
         return None
-    return datetime.combine(parsed.due or now.date(), parsed.at or FALLBACK_AT)
+    return datetime.combine(parsed.due or now.date(), parsed.at or time(0, 0))
+
+
+def _advance(parsed) -> int | None:
+    """闹钟提前量：具体时刻默认到点即响（0），「提前X」优先；全天/时段交给存储层。"""
+    if parsed.at is None:
+        return parsed.advance_minutes
+    return parsed.advance_minutes if parsed.advance_minutes is not None else 0
 
 
 def _ensure_lists(store: ReminderStore) -> None:
@@ -135,16 +147,28 @@ def _seq_of(ctx: Context, ref: str) -> int:
     return ctx.seq.assign(ref, day=ctx.today)
 
 
-def _item_due(item: dict) -> datetime | None:
-    """remindctl / FakeStore 的 dueDate → datetime；认不出给 None。"""
-    text = str(item.get("dueDate") or item.get("due") or "").strip().replace("T", " ")
-    text = text.replace("Z", "")[:19]
+def _stamp_of(value) -> datetime | None:
+    """本地墙钟串 → datetime；认不出给 None（"YYYY-MM-DD" 落在当天 00:00）。"""
+    text = str(value or "").strip().replace("T", " ").replace("Z", "")[:19]
     for fmt in (STAMP_FMT, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
     return None
+
+
+def _item_due(item: dict) -> datetime | None:
+    """remindctl / FakeStore 的 dueDate → datetime；认不出给 None。"""
+    return _stamp_of(item.get("dueDate") or item.get("due"))
+
+
+def _item_alarm(item: dict, due: datetime) -> time | None:
+    """同一时刻响的闹钟 → 时刻；跨日的（提前到前一天）不算在图上的时刻列。"""
+    alarm = _stamp_of(item.get("alarmDate"))
+    if alarm is None or alarm.date() != due.date():
+        return None
+    return alarm.time()
 
 
 def _age_days(row: dict, now: datetime) -> int:
@@ -189,8 +213,9 @@ def cmd_add(ctx: Context, args) -> Result:
         return _park(ctx, parsed, args.note)
     _ensure_lists(ctx.store)
     reminder_id = ctx.store.add(parsed.title, due_at, _list_of(parsed),
-                                advance_minutes=parsed.advance_minutes,
-                                note=args.note)
+                                advance_minutes=_advance(parsed),
+                                note=args.note,
+                                all_day=parsed.all_day, slot=parsed.slot)
     if not reminder_id:
         return _park(ctx, parsed, args.note, due_at=due_at,
                      error="Reminder 写不进去，已留在收件箱")
@@ -198,9 +223,12 @@ def cmd_add(ctx: Context, args) -> Result:
 
 
 def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None) -> dict:
+    """写成功后的回执：``at`` 只报具体时刻，全天/时段另给标记（别把 00:00 当时刻）。"""
     return {"ok": True, "seq": _seq_of(ctx, f"reminder:{reminder_id}"),
             "title": title or parsed.title, "list": _list_of(parsed),
-            "due": due_at.date().isoformat(), "at": _hhmm(due_at),
+            "due": due_at.date().isoformat(),
+            "at": _hhmm(due_at) if parsed.at is not None else None,
+            "all_day": parsed.all_day, "slot": parsed.slot,
             "reminder_id": reminder_id, "matched": parsed.matched,
             "source": "reminder"}
 
@@ -212,7 +240,8 @@ def _park(ctx: Context, parsed, note, error: str | None = None,
     payload = {"ok": error is None, "seq": _seq_of(ctx, f"inbox:{inbox_id}"),
                "title": parsed.title, "list": None, "source": "inbox",
                "due": due_at.date().isoformat() if due_at else None,
-               "at": _hhmm(due_at) if due_at else None,
+               "at": _hhmm(due_at) if due_at and parsed.at is not None else None,
+               "all_day": parsed.all_day, "slot": parsed.slot,
                "inbox_id": inbox_id, "matched": parsed.matched}
     if error:
         payload["error"] = error
@@ -250,8 +279,9 @@ def cmd_clarify(ctx: Context, args) -> Result:
     title = parsed.title or row["title"]
     _ensure_lists(ctx.store)
     reminder_id = ctx.store.add(title, due_at, _list_of(parsed),
-                                advance_minutes=parsed.advance_minutes,
-                                note=row["note"])
+                                advance_minutes=_advance(parsed),
+                                note=row["note"],
+                                all_day=parsed.all_day, slot=parsed.slot)
     if not reminder_id:
         return Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
                        "inbox_id": row["id"]}, code=EXIT_FAIL)
@@ -341,26 +371,36 @@ def _open_items(ctx: Context) -> list[tuple[str, dict]]:
 
 
 def _today_tasks(ctx: Context, items) -> list:
-    """今天该看的（含逾期）＋ 未来 7 天内的（图上「接下来」区）；更远的不传。
+    """今天该看的（含逾期）＋ 未来 7 天内的「接下来」；更远的不传。
 
     未来条目也带上 ``due``：渲染层靠它把「今日」和「接下来」分开，并印出
     「周五 15:30」这样的日期前缀。窗口宽度取 ``render.NEXT_DAYS``，只在渲染层定义一次。
     每条都带 ``ref``：图上号就靠它跟 ``board_index`` 对上。
     """
-    rows = []
-    for name, item in items:
-        due = _item_due(item)
-        if due is None or (due.date() - ctx.today).days > render.NEXT_DAYS:
-            continue
-        rows.append(render.Entry(
-            number=0,                     # 占位：图上号由 _board_numbers 决定
-            title=str(item.get("title") or ""),
-            at=None if due.time() == time(0, 0) else due.time(),
-            list_name=name,
-            overdue_days=max(0, (ctx.today - due.date()).days),
-            due=due.date(),
-            ref=f"reminder:{item.get('id')}"))
-    return rows
+    return [entry for entry in (_reminder_entry(name, item, ctx.today)
+                                for name, item in items) if entry is not None]
+
+
+def _reminder_entry(name: str, item: dict, today: date):
+    """一条 Reminder → 图上的一行；太远（超过 7 天）或没有 due 的返回 None。
+
+    全天条目 ``at=None`` + ``all_day=True``：**不许把 00:00 当时刻**（EventKit 存的
+    全天就是本地零点）。时段条目的 12:00 / 18:00 是闹钟，另放 ``alarm``，不进 ``at``。
+    """
+    due = _item_due(item)
+    if due is None or (due.date() - today).days > render.NEXT_DAYS:
+        return None
+    all_day = bool(item.get("all_day"))
+    at = None if all_day or due.time() == time(0, 0) else due.time()
+    return render.Entry(
+        number=0,                     # 占位：图上号由 _board_numbers 决定
+        title=str(item.get("title") or ""), at=at,
+        all_day=all_day,
+        alarm=_item_alarm(item, due) if at is None else None,
+        list_name=name,
+        overdue_days=max(0, (today - due.date()).days),
+        due=due.date(),
+        ref=f"reminder:{item.get('id')}")
 
 
 def _persist_board(ctx: Context, items, numbers: dict[str, int]) -> list[str]:
@@ -509,9 +549,11 @@ def _human(command: str, payload: dict) -> str:
 
 
 def _when(payload: dict) -> str:
+    """回执里的时间：具体时刻 / 上午 / 下午 / 全天（与图上同一个词）。"""
     if not payload.get("due"):
         return "（收件箱，还没定时间）"
-    return f" · {payload['due']} {payload.get('at') or ''}".rstrip()
+    clock = payload.get("at") or SLOT_WORDS.get(str(payload.get("slot") or "")) or ALL_DAY_WORD
+    return f" · {payload['due']} {clock}"
 
 
 def _human_inbox(payload: dict) -> str:

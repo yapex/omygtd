@@ -16,7 +16,7 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Protocol, runtime_checkable
 
 DEFAULT_LISTS = ("GTD", "Waiting")
@@ -28,6 +28,9 @@ FALLBACK_PATHS = ("~/.local/bin/remindctl", "/opt/homebrew/bin/remindctl",
                   "/usr/local/bin/remindctl")
 
 TIME_FMT = "%Y-%m-%d %H:%M"
+DAY_FMT = "%Y-%m-%d"
+# 时段标记 → 闹钟时刻：due 走全天（整天挂锁屏），到点响一次
+SLOT_ALARMS = {"am": time(12, 0), "pm": time(18, 0)}
 
 
 # ---------------------------------------------------------------- 守卫
@@ -54,10 +57,15 @@ class ReminderStore(Protocol):
         """确保自己负责的列表都存在。"""
         ...
 
-    def add(self, title: str, due_at: datetime, list_name: str,
+    def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
-            note: str = "", url: str = "") -> str:
-        """新建一条提醒，返回 id；失败返回 ""。"""
+            note: str = "", url: str = "",
+            all_day: bool = False, slot: str | None = None) -> str:
+        """新建一条提醒，返回 id；失败返回 ""。
+
+        ``all_day=True`` → due 只给日期（整天挂锁屏）；``slot``（am / pm）→ 同样
+        due 全天，另外挂 12:00 / 18:00 的闹钟到点响一次。
+        """
         ...
 
     def complete(self, reminder_id: str) -> bool:
@@ -84,6 +92,38 @@ def _stamp(moment) -> str:
     if isinstance(moment, datetime):
         return moment.strftime(TIME_FMT)
     return str(moment)
+
+
+def _day_of(moment) -> date:
+    """``datetime`` / ``date`` 一律取日期部分（全天条目只要日期）。"""
+    return moment.date() if isinstance(moment, datetime) else moment
+
+
+def _reminder_when(due_at, *, all_day: bool, slot: str | None):
+    """算出 ``--due`` 串与闹钟：→ (due 串, alarm datetime | None, 是否全天)。
+
+    - 全天（``all_day``）或时段（``slot``）→ due 只送日期，EventKit 存 ``dueDateIsAllDay``
+    - ``slot=am/pm`` → 当天 12:00 / 18:00 响一次；due 仍是全天
+    - 其余 → due 送本地墙钟，闹钟由 ``advance_minutes`` 决定（见调用方）
+    """
+    alarm = None
+    if slot in SLOT_ALARMS:
+        alarm = datetime.combine(_day_of(due_at), SLOT_ALARMS[slot])
+    if all_day or alarm is not None:
+        return _day_of(due_at).strftime(DAY_FMT), alarm, True
+    return _stamp(due_at), None, False
+
+
+def _alarm_of(due_at, advance_minutes: int | None, *, day_only: bool, alarm):
+    """闹钟最终值：时段/全天自带的优先；否则按「提前 N 分钟」从 due 倒推。
+
+    ``None`` = 不响（不传 ``--alarm``）。全天条目没有钟点，提前量无从算起 → 忽略。
+    """
+    if alarm is not None or advance_minutes is None:
+        return alarm
+    if day_only or not isinstance(due_at, datetime):
+        return None
+    return due_at - timedelta(minutes=int(advance_minutes))
 
 
 def _parse_utc(value) -> datetime | None:
@@ -125,6 +165,7 @@ def _localize(item: dict) -> dict:
     """
     out = dict(item)
     all_day = bool(item.get("dueDateIsAllDay"))
+    out["all_day"] = all_day            # 上层只认这个标记：全天条目「没有时刻」
     for key in ("dueDate", "alarmDate"):
         if out.get(key):
             out[key] = _local_stamp(out[key], all_day=(key == "dueDate" and all_day))
@@ -202,18 +243,21 @@ class RemindctlAdapter:
             return []
         return [str(item.get("title")) for item in _records(_loads(_out(proc)))]
 
-    def add(self, title: str, due_at: datetime, list_name: str,
+    def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
-            note: str = "", url: str = "") -> str:
+            note: str = "", url: str = "",
+            all_day: bool = False, slot: str | None = None) -> str:
         """新建一条提醒，返回 id；失败返回 ""。
 
         `advance_minutes`：提前几分钟响铃（alarm = due_at - advance）；
         传 0 = 到点即响，传 None = 不设闹钟（--alarm 不出现）。
+        `all_day` / `slot`：due 只送日期（全天）；`slot=am/pm` 再挂 12:00/18:00 闹钟。
         """
         _guard_list(list_name)
-        args = ["add", "--title", title, "--list", list_name, "--due", _stamp(due_at)]
-        if advance_minutes is not None:
-            alarm = due_at - timedelta(minutes=int(advance_minutes))
+        due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
+        alarm = _alarm_of(due_at, advance_minutes, day_only=day_only, alarm=alarm)
+        args = ["add", "--title", title, "--list", list_name, "--due", due_text]
+        if alarm is not None:
             args += ["--alarm", _stamp(alarm)]
         if note:
             args += ["--notes", note]
@@ -287,20 +331,22 @@ class FakeStore:
         for name in self._lists:
             _guard_list(name)
 
-    def add(self, title: str, due_at: datetime, list_name: str,
+    def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
-            note: str = "", url: str = "") -> str:
+            note: str = "", url: str = "",
+            all_day: bool = False, slot: str | None = None) -> str:
         _guard_list(list_name)
         self._seq += 1
         reminder_id = f"fake-{self._seq:04d}"
-        alarm = None
-        if advance_minutes is not None and isinstance(due_at, datetime):
-            alarm = due_at - timedelta(minutes=int(advance_minutes))
+        due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
+        alarm = _alarm_of(due_at, advance_minutes, day_only=day_only, alarm=alarm)
         self._items[reminder_id] = {
             "id": reminder_id,
             "title": title,
             "listName": list_name,
-            "dueDate": _stamp(due_at),
+            "dueDate": due_text,              # 全天条目只有日期（与 adapter 读侧同构）
+            "dueDateIsAllDay": day_only,
+            "all_day": day_only,
             "alarmDate": _stamp(alarm) if alarm else "",
             "notes": note,
             "url": url,
@@ -329,12 +375,14 @@ class FakeStore:
 
 # ---------------------------------------------------------------- 上层示例
 
-def schedule(store: ReminderStore, title: str, due_at: datetime,
+def schedule(store: ReminderStore, title: str, due_at,
              list_name: str = "GTD",
-             advance_minutes: int | None = None) -> str:
+             advance_minutes: int | None = None,
+             all_day: bool = False, slot: str | None = None) -> str:
     """上层函数的样板：只依赖 Protocol，不依赖具体实现。
 
     真实运行时传 RemindctlAdapter，测试时传 FakeStore，行为一致。
     """
     store.ensure_lists()
-    return store.add(title, due_at, list_name, advance_minutes)
+    return store.add(title, due_at, list_name, advance_minutes,
+                     all_day=all_day, slot=slot)

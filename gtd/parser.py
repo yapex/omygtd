@@ -3,7 +3,12 @@
 纯函数：不读时钟、不读库、不调网络；`now` 由调用方注入。
 只用标准库 `re` + `datetime`。
 
-老板定的截止点语义：上午→12:00、下午→18:00、晚上/今天→22:30。
+老板定的时段语义（Reminder 的 due 与 alarm 是两回事，可组合）：
+
+- 只给日期、没给钟点 → **due 当天全天、无闹钟**（整天挂在锁屏上，不再兜底 22:30）
+- `上午` / `下午` → due 当天全天 + 闹钟 12:00 / 18:00（记 ``slot="am"/"pm"``，不产时刻）
+- 钟点（`12:00`、`今晚 22:30`）→ due 就是那一刻（精度优先于时段词）
+
 一句话里多个时间词，日期取全句最后一个；**时刻只认句首时间前缀**里的最后一个，
 正文中间提到的时间既不剥进标题、也不参与时刻解析。
 标题只抠**句首连续的时间前缀**（正文中间提到的时间不动），
@@ -18,13 +23,13 @@ from datetime import date, datetime, time, timedelta
 
 LIST_DEFAULT = "GTD"
 LIST_WAITING = "Waiting"
-DEFAULT_AT = time(22, 30)          # 「今天」没别的时刻词 → 当天截止 22:30
+SLOT_AM, SLOT_PM = "am", "pm"
+# 时段词 → 内部标记：due 走「当天全天」，闹钟到点响一次（parser 只记标记，不产时刻）
+_SLOTS = {"上午": SLOT_AM, "下午": SLOT_PM}
 
 _CUTOFF = {
-    "上午": time(12, 0),
     "中午": time(12, 0),
     "中午前": time(12, 0),
-    "下午": time(18, 0),
     "晚上": time(22, 30),
     "傍晚": time(19, 0),
 }
@@ -73,10 +78,19 @@ _PUNCT = " \t\u3000，。、；：！？,.;:!?…·—～~「」『』“”\"'(
 class Parsed:
     title: str                          # 去掉时间表达后的任务标题
     due: date | None = None             # 到期日
-    at: time | None = None              # 精确时刻（None = 当天不定时）
+    at: time | None = None              # 精确时刻（None = 没有具体钟点）
     advance_minutes: int | None = None  # 提前量（可选）
     matched: str = ""                   # 命中的时间原文，便于回显与调试
     list: str = LIST_DEFAULT            # GTD / Waiting
+    slot: str | None = None             # 时段标记 am / pm（due 全天 + 闹钟到点响）
+
+    @property
+    def all_day(self) -> bool:
+        """有日期、没钟点、也没时段词 → Reminder 存成「全天」（整天挂锁屏、不响）。
+
+        全天与「没说时间」不是一回事：没说时间进收件箱，全天是已经排到某一天了。
+        """
+        return self.due is not None and self.at is None and self.slot is None
 
 
 @dataclass(frozen=True)
@@ -168,7 +182,10 @@ def _make_hit(match: re.Match) -> _Hit | None:
                 "day_offset": offset}
     elif g.get("period"):
         offset, base = _COMPOUND_PERIOD.get(g["period"], (None, g["period"]))
-        kind, data = "at", {"value": _CUTOFF.get(base), "day_offset": offset}
+        slot = _SLOTS.get(base)
+        kind = "at"
+        data = {"value": None if slot else _CUTOFF.get(base),
+                "day_offset": offset, "slot": slot}
     else:
         return None
     return _Hit(kind, match.start(), match.end(), raw, data)
@@ -243,26 +260,22 @@ def _resolve_due(hits: list[_Hit], today: date) -> date | None:
     return due
 
 
-def _has_date(hits: list[_Hit]) -> bool:
-    """前缀里是否给了日期（含「今早/明晚」这类自带日偏移的复合词）。"""
-    return any(hit.kind == "date" or hit.data.get("day_offset") is not None
-               for hit in hits)
-
-
-def _resolve_at(hits: list[_Hit], due: date | None) -> time | None:
-    """时刻只认**句首时间前缀**里的最后一个；只给日期没给时刻 → 当天 22:30 兜底。
+def _resolve_at(hits: list[_Hit]) -> time | None:
+    """时刻只认**句首时间前缀**里的最后一个。
 
     正文里提到的时间（「…顺便看看 3 点的会」）不参与，否则前面给了截止点
-    （中午前=12:00）却会被正文的钟点覆盖掉。兜底只在日期真的解析出来时给，
-    否则「13月45日交材料」这种坏日期会从「进收件箱」变成「排到今天 22:30」。
+    （中午前=12:00）却会被正文的钟点覆盖掉。只给日期不给钟点就是 None
+    —— 「没钟点」现在是全天（`Parsed.all_day`），**不再兜底 22:30**。
     """
     values = [hit.data.get("value") for hit in hits
               if hit.kind == "at" and hit.data.get("value") is not None]
-    if values:
-        return values[-1]
-    if due is not None and _has_date(hits):
-        return DEFAULT_AT
-    return None
+    return values[-1] if values else None
+
+
+def _resolve_slot(hits: list[_Hit]) -> str | None:
+    """时段标记（上午 / 下午）同样只认句首前缀里的最后一个。"""
+    slots = [hit.data.get("slot") for hit in hits if hit.data.get("slot")]
+    return slots[-1] if slots else None
 
 
 def _resolve_advance(hits: list[_Hit]) -> int | None:
@@ -362,10 +375,12 @@ def parse(text: str, *, now: datetime) -> Parsed:
     list_name, extra_spans = _resolve_list(text)
     cut = _strip_hits(text, hits)
     due = _resolve_due(hits, now.date())
+    at = _resolve_at(cut)
     return Parsed(
         title=_cut_title(text, [(hit.start, hit.end) for hit in cut] + extra_spans),
         due=due,
-        at=_resolve_at(cut, due),
+        at=at,
+        slot=None if at is not None else _resolve_slot(cut),   # 钟点优先于时段词
         advance_minutes=_resolve_advance(hits),
         matched=_echo(text, hits),
         list=list_name,

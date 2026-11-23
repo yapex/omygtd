@@ -298,6 +298,51 @@ def test_board_order_leaves_out_what_is_not_drawn():
     assert titles == ["今天的事", "未来1", "未来2", "未来3", "未来4", "未来5"]
 
 
+# ---------- 11b. 全天 / 上午 / 下午（t_0541f6c3） ----------
+#
+# Reminder 的全天条目没有时刻：图上是「全天」；带 12:00 / 18:00 闹钟的写「上午 / 下午」。
+# 全天不是逾期 —— 视觉上永不上红色。
+
+def all_day(title, *, number=1, alarm=None, days=0):
+    return Entry(number=number, title=title, at=None, list_name="GTD", overdue_days=0,
+                 due=NOW.date() + timedelta(days=days), all_day=True, alarm=alarm)
+
+
+def test_all_day_without_alarm_reads_all_day():
+    page, *_ = build_today_html([all_day("买菜")], now=NOW)
+    assert '<div class="at allday">全天</div>' in page
+
+
+def test_all_day_is_never_red():
+    """全天不是逾期：不许用 .past 的红褐色，另给更淡的灰 #8a8078。"""
+    page, *_ = build_today_html([all_day("买菜")], now=NOW)
+    assert "at past" not in page
+    assert re.search(r"\.at\.allday \{[^}]*#8a8078", page)
+
+
+def test_all_day_noon_alarm_reads_morning():
+    page, *_ = build_today_html([all_day("买菜", alarm=time(12, 0))], now=NOW)
+    assert '<div class="at allday">上午</div>' in page
+
+
+def test_all_day_evening_alarm_reads_afternoon():
+    page, *_ = build_today_html([all_day("取快递", alarm=time(18, 0))], now=NOW)
+    assert '<div class="at allday">下午</div>' in page
+
+
+def test_all_day_odd_alarm_keeps_the_clock():
+    """非约定时刻（09:30）不硬套时段词 → 「全天 09:30」，不撒谎。"""
+    page, *_ = build_today_html([all_day("体检", alarm=time(9, 30))], now=NOW)
+    assert "全天 09:30" in page
+
+
+def test_upcoming_all_day_shows_weekday_and_all_day():
+    """接下来区：日期前缀照旧，时刻位置写「全天」。"""
+    page, *_ = build_today_html(
+        [entry("今天的事", at=time(9, 30)), all_day("买菜", number=2, days=2)], now=NOW)
+    assert "周三 全天" in visible(page)
+
+
 # ---------- 12. 真的出一张 PNG（唯一的截图用例） ----------
 
 @pytest.mark.skipif(_find_chrome() is None, reason="本机没有 Chrome")
