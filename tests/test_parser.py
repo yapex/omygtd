@@ -314,3 +314,69 @@ def test_parsed_is_frozen():
     """Parsed 不可变。"""
     with pytest.raises(Exception):
         Parsed(title="x").title = "y"
+
+
+# ---------- 48+：时间词带空格 / 句首连续吞并（t_707f252b） ----------
+#
+# 事故：`今天晚上 10 点半 卖出 X` 只剥了「今天晚上」，「10 点半」留在标题里。
+# 根因：时间词之间允许空格，但单个词表项匹配不到带空格的整段。
+# 口径：空格（半角/全角）一律当可选连接符；句首连续的时间成分整段吃掉，
+#       `matched` 回显被吃掉的原文（含空格）。
+
+SPACED_PREFIX = [
+    ("今天晚上 10 点半 卖出 X", "卖出 X", TODAY, time(22, 30), "今天晚上 10 点半"),
+    ("今天晚上10点半 卖出 X", "卖出 X", TODAY, time(22, 30), "今天晚上10点半"),
+    ("今夜10:30 卖出 X", "卖出 X", TODAY, time(22, 30), "今夜10:30"),
+    ("今天 晚上 10 点 30 分 卖出 X", "卖出 X", TODAY, time(22, 30),
+     "今天 晚上 10 点 30 分"),
+    ("明早 8 点 提醒我交材料", "交材料", date(2026, 11, 24), time(8, 0), "明早 8 点"),
+    ("后天下午 3 点半 开会", "开会", date(2026, 11, 25), time(15, 30), "后天下午 3 点半"),
+    ("下午三点半 开会", "开会", None, time(15, 30), "下午三点半"),
+    # 没有日期词时 parser 不自己造日期，due 留 None；CLI 的 _due_at 用 now.date() 兜底成今天
+    ("10点半 卖出 X", "卖出 X", None, time(22, 30), "10点半"),
+    # 整句都是时间词 → 抠完为空串，与既有 test_half_past（「15点半」→ ""）同一约定
+    ("晚上10点半", "", None, time(22, 30), "晚上10点半"),
+]
+
+
+@pytest.mark.parametrize("text,title,due,at,matched", SPACED_PREFIX)
+def test_spaced_time_prefix_is_eaten_whole(text, title, due, at, matched):
+    """时间词之间带空格也要整段吃掉，matched 回显含空格的原文。"""
+    got = p(text)
+    assert got.title == title
+    assert got.due == due
+    assert got.at == at
+    assert got.matched == matched
+
+
+def test_fullwidth_space_between_time_words():
+    """全角空格（U+3000）同样是可选连接符。"""
+    got = p("今天晚上\u300010\u3000点半\u3000卖出 X")
+    assert got.title == "卖出 X"
+    assert got.at == time(22, 30)
+    assert got.matched == "今天晚上\u300010\u3000点半"
+
+
+def test_spaced_prefix_absorbs_every_following_time_word():
+    """句首连续吞并：每个交界处都隔着空格也要一直吃到正文为止。"""
+    got = p("明天 中午前 交材料")
+    assert got.title == "交材料"
+    assert got.due == date(2026, 11, 24)
+    assert got.at == time(12, 0)
+    assert got.matched == "明天 中午前"
+
+
+def test_prefix_across_punctuation_is_eaten():
+    """时间前缀之间夹标点也算连续（旧的「明天，交材料」同一族）。"""
+    got = p("明天，中午前交材料")
+    assert got.title == "交材料"
+    assert got.at == time(12, 0)
+
+
+def test_interior_time_is_not_stripped():
+    """正文中间提到的时间不剥 —— 只剥句首连续的时间前缀。"""
+    got = p("明天中午前交材料，顺便看看 3 点的会")
+    assert got.title == "交材料，顺便看看 3 点的会"
+    assert got.due == date(2026, 11, 24)
+    # 注：at 仍按「时刻取最后一个」解析成 15:00（正文里的 3 点也参与），本次不改时刻解析口径
+
