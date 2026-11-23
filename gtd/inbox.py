@@ -23,6 +23,8 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .priority import PRIORITY_NONE, normalize
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = PROJECT_ROOT / "data" / "gtd.db"
 
@@ -36,7 +38,8 @@ CREATE TABLE IF NOT EXISTS inbox (
   note        TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL,
   moved_at    TEXT,
-  reminder_id TEXT
+  reminder_id TEXT,
+  priority    TEXT NOT NULL DEFAULT 'none'   -- none|low|medium|high，与 Reminders.app 同口径
 );
 
 CREATE TABLE IF NOT EXISTS daily_seq (
@@ -79,11 +82,19 @@ MIRROR_COLS = ("reminder_id", "title", "list_name", "due_at", "completed", "sync
 # 建表后校验列：旧库（v1）的 daily_seq 是 day/seq/task_id，撞名但不兼容，
 # 不能靠 CREATE TABLE IF NOT EXISTS 静默留着——直接报错让人先迁移。
 TABLE_COLUMNS = {
-    "inbox": ("id", "title", "note", "created_at", "moved_at", "reminder_id"),
+    "inbox": ("id", "title", "note", "created_at", "moved_at", "reminder_id", "priority"),
     "daily_seq": ("day", "seq", "ref"),
     "daily_seq_hwm": ("day", "last_seq"),
     "mirror": MIRROR_COLS,
     "board_index": ("day", "display_seq", "reminder_id"),
+}
+
+# 老库逐列补丁：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列，所以缺的列
+# 只能 ALTER 补。先 PRAGMA 查一遍再改，重复跑 N 次也只改一次（幂等）。
+MIGRATIONS = {
+    "inbox": {
+        "priority": "ALTER TABLE inbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'none'",
+    },
 }
 
 
@@ -107,6 +118,15 @@ def _day_key(day=None) -> str:
     if isinstance(day, date):
         return day.isoformat()
     return str(day)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库补列（如 inbox.priority）：缺什么补什么，补过就不再动。"""
+    for table, columns in MIGRATIONS.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, sql in columns.items():
+            if column not in have:
+                conn.execute(sql)
 
 
 def _check_schema(conn: sqlite3.Connection) -> None:
@@ -152,6 +172,7 @@ class _LocalTable:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.executescript(SCHEMA_SQL)
+        _migrate(conn)
         _check_schema(conn)
         return conn
 
@@ -178,14 +199,22 @@ class _LocalTable:
 class Inbox(_LocalTable):
     """没时间的念头。迁出 = 打标记，不删行。"""
 
-    def add(self, title, note="", *, now=None) -> int:
+    def add(self, title, note="", *, now=None, priority: str = PRIORITY_NONE) -> int:
+        """落一条念头；2 分钟内同标题视为同一条（幂等）。
+
+        ``priority`` 跟 Reminders.app 同口径（none/low/medium/high）。重复命中已有行时
+        不改标题，但如果这次说了「重要」，补标上去——老板重说一遍就是想让它重要。
+        """
         at = _now(now)
+        level = normalize(priority)
         dup = self._recent_duplicate(title, at)
         if dup is not None:
+            if level != PRIORITY_NONE:
+                self.set_priority(dup, level)
             return dup
         cur = self._db().execute(
-            "INSERT INTO inbox (title, note, created_at) VALUES (?, ?, ?)",
-            (title, note, _iso(at)))
+            "INSERT INTO inbox (title, note, created_at, priority) VALUES (?, ?, ?, ?)",
+            (title, note, _iso(at), level))
         new_id = cur.lastrowid
         assert new_id is not None
         return new_id
@@ -203,9 +232,16 @@ class Inbox(_LocalTable):
 
     def pending(self) -> list[dict]:
         rows = self._db().execute(
-            "SELECT id, title, note, created_at, moved_at, reminder_id FROM inbox "
+            "SELECT id, title, note, created_at, moved_at, reminder_id, priority FROM inbox "
             "WHERE moved_at IS NULL ORDER BY id ASC").fetchall()
         return [dict(row) for row in rows]
+
+    def set_priority(self, inbox_id, value, *, now=None) -> bool:
+        """改一条未迁出念头的优先级；已迁出（或没有这一行）返回 False。"""
+        cur = self._db().execute(
+            "UPDATE inbox SET priority=? WHERE id=? AND moved_at IS NULL",
+            (normalize(value), inbox_id))
+        return cur.rowcount > 0
 
     def mark_moved(self, inbox_id, reminder_id, *, now=None) -> bool:
         """写 moved_at + reminder_id；已是迁出态的行不再改（返回 False）。"""

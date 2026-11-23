@@ -19,6 +19,9 @@ import subprocess
 from datetime import date, datetime, time, timedelta
 from typing import Protocol, runtime_checkable
 
+from . import priority as prio
+from .priority import PRIORITY_NONE
+
 DEFAULT_LISTS = ("GTD", "Waiting")
 TEST_LIST = "GTD_TEST"
 FORBIDDEN_IN_TESTS = {"GTD", "Waiting", "提醒事项"}
@@ -60,11 +63,13 @@ class ReminderStore(Protocol):
     def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
-            all_day: bool = False, slot: str | None = None) -> str:
+            all_day: bool = False, slot: str | None = None,
+            priority: str = PRIORITY_NONE) -> str:
         """新建一条提醒，返回 id；失败返回 ""。
 
         ``all_day=True`` → due 只给日期（整天挂锁屏）；``slot``（am / pm）→ 同样
-        due 全天，另外挂 12:00 / 18:00 的闹钟到点响一次。
+        due 全天，另外挂 12:00 / 18:00 的闹钟到点响一次。``priority`` 是 Reminders.app
+        的原生四档（none/low/medium/high），写进 Reminder 后手机上也能看到感叹号。
         """
         ...
 
@@ -166,6 +171,7 @@ def _localize(item: dict) -> dict:
     out = dict(item)
     all_day = bool(item.get("dueDateIsAllDay"))
     out["all_day"] = all_day            # 上层只认这个标记：全天条目「没有时刻」
+    out["priority"] = prio.normalize(item.get("priority"))   # 四档归一，缺省 none
     for key in ("dueDate", "alarmDate"):
         if out.get(key):
             out[key] = _local_stamp(out[key], all_day=(key == "dueDate" and all_day))
@@ -246,12 +252,14 @@ class RemindctlAdapter:
     def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
-            all_day: bool = False, slot: str | None = None) -> str:
+            all_day: bool = False, slot: str | None = None,
+            priority: str = PRIORITY_NONE) -> str:
         """新建一条提醒，返回 id；失败返回 ""。
 
         `advance_minutes`：提前几分钟响铃（alarm = due_at - advance）；
         传 0 = 到点即响，传 None = 不设闹钟（--alarm 不出现）。
         `all_day` / `slot`：due 只送日期（全天）；`slot=am/pm` 再挂 12:00/18:00 闹钟。
+        `priority`：none/low/medium/high，非 none 才传 ``--priority``（与 Reminders.app 同档）。
         """
         _guard_list(list_name)
         due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
@@ -263,6 +271,8 @@ class RemindctlAdapter:
             args += ["--notes", note]
         if url:
             args += ["--url", url]
+        if prio.is_set(priority):
+            args += ["--priority", prio.normalize(priority)]
         proc = self._run(args + ["--json"])
         if not _ok(proc):
             return ""
@@ -334,7 +344,8 @@ class FakeStore:
     def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
-            all_day: bool = False, slot: str | None = None) -> str:
+            all_day: bool = False, slot: str | None = None,
+            priority: str = PRIORITY_NONE) -> str:
         _guard_list(list_name)
         self._seq += 1
         reminder_id = f"fake-{self._seq:04d}"
@@ -350,6 +361,7 @@ class FakeStore:
             "alarmDate": _stamp(alarm) if alarm else "",
             "notes": note,
             "url": url,
+            "priority": prio.normalize(priority),
             "isCompleted": False,
         }
         return reminder_id
@@ -378,11 +390,12 @@ class FakeStore:
 def schedule(store: ReminderStore, title: str, due_at,
              list_name: str = "GTD",
              advance_minutes: int | None = None,
-             all_day: bool = False, slot: str | None = None) -> str:
+             all_day: bool = False, slot: str | None = None,
+             priority: str = PRIORITY_NONE) -> str:
     """上层函数的样板：只依赖 Protocol，不依赖具体实现。
 
     真实运行时传 RemindctlAdapter，测试时传 FakeStore，行为一致。
     """
     store.ensure_lists()
     return store.add(title, due_at, list_name, advance_minutes,
-                     all_day=all_day, slot=slot)
+                     all_day=all_day, slot=slot, priority=priority)

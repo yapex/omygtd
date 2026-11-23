@@ -485,3 +485,65 @@ def test_clock_beats_period_word():
     assert got.at == time(15, 0) and got.slot is None and got.all_day is False
 
 
+# ---------- 重要性 → Reminders.app 原生 priority ----------
+#
+# 老板要的是「和 Reminder 里一致的重要级」，不是自造布尔标记：说「很重要 / 急」
+# 就是 high，光说「重要 / 优先」是 medium。词可以在句中或句尾（时间词只剥句首），
+# 但剥完不许把标题剥空、也不许把「优先股」「重要性」这种正文词剥掉。
+
+def test_importance_high_words():
+    assert p("对腾讯Q3财报做综合分析，这个很重要").priority == "high"
+    assert p("明天买菜，急").priority == "high"
+    assert p("着急：回老王电话").priority == "high"
+    assert p("这件事非常重要").priority == "high"
+
+
+def test_importance_medium_words():
+    assert p("重要：整理投资笔记").priority == "medium"
+    assert p("优先：把合同签了").priority == "medium"
+    assert p("这个重要").priority == "medium"
+
+
+def test_importance_no_words_is_none():
+    assert p("明天下午交材料").priority == "none"
+    assert Parsed(title="x").priority == "none"
+
+
+def test_importance_word_at_tail_is_stripped():
+    got = p("对腾讯Q3财报做综合分析，这个很重要")
+    assert got.title == "对腾讯Q3财报做综合分析"
+    assert "重要" not in got.title
+
+
+def test_importance_word_at_head_is_stripped():
+    got = p("很重要：交房租")
+    assert got.title == "交房租" and got.priority == "high"
+
+
+def test_importance_word_in_middle_is_stripped():
+    """「很重要」在句中（后面跟标点）也要剥——时间词只剥句首，这个不受限。"""
+    got = p("这个任务很重要，明天交")
+    assert got.title == "这个任务，明天交"
+    assert got.priority == "high"
+
+
+def test_importance_only_sentence_keeps_title():
+    """整句只剩「这个很重要」：标题不许变空，原句留着，优先级照标。"""
+    got = p("这个很重要")
+    assert got.title == "这个很重要" and got.priority == "high"
+
+
+def test_importance_compound_words_are_not_touched():
+    """正文里的「优先股 / 重要性 / 不着急 / 重要的事」不算重要性说法。"""
+    cases = {
+        "今天优先股持仓复盘": "优先股持仓复盘",
+        "重要性分析报告": "重要性分析报告",
+        "不着急，下周再说": "不着急，下周再说",
+        "买鸡蛋，重要的事": "买鸡蛋，重要的事",
+    }
+    for text, expected in cases.items():
+        got = p(text)
+        assert got.priority == "none", text
+        assert got.title == expected, text
+
+

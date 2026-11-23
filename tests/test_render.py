@@ -22,15 +22,16 @@ NOW = datetime(2026, 11, 23, 21, 40)          # 周一晚上 21:40
 
 
 def entry(title, *, number=1, at=None, list_name="GTD", overdue_days=0, kind="task",
-          due=None, ref=""):
+          due=None, ref="", priority="none"):
     return Entry(number=number, title=title, at=at, list_name=list_name,
-                 overdue_days=overdue_days, kind=kind, due=due, ref=ref)
+                 overdue_days=overdue_days, kind=kind, due=due, ref=ref,
+                 priority=priority)
 
 
-def later(title, *, days, number=2, at=None, list_name="GTD", ref=""):
+def later(title, *, days, number=2, at=None, list_name="GTD", ref="", priority="none"):
     """未来第 days 天的条目（「接下来」区的候选）。"""
     return entry(title, number=number, at=at, list_name=list_name,
-                 due=NOW.date() + timedelta(days=days), ref=ref)
+                 due=NOW.date() + timedelta(days=days), ref=ref, priority=priority)
 
 
 def next_block(page: str) -> str:
@@ -474,3 +475,43 @@ def test_view_formats_are_md_and_json():
 def test_render_view_rejects_unknown_format():
     with pytest.raises(ValueError, match="未知格式"):
         render_view([], now=NOW, fmt="xml")
+
+
+# ---------- 12. 优先级：感叹号标记 + 收件箱按优先级排 ----------
+#
+# 口径与 Reminders.app 一致：high !!!、medium !!、low !、none 不印。
+# 只影响收件箱区的顺序；今天区 / 接下来区仍按日期排（它们也印标记，但顺序不动）。
+
+def test_inbox_rows_sort_by_priority_high_first():
+    entries = [entry("买鸡蛋", number=4, kind="inbox"),
+               entry("整理财报", number=5, kind="inbox", priority="medium"),
+               entry("交房租", number=6, kind="inbox", priority="high")]
+    md = render_today_markdown(entries, now=NOW)
+    assert (md.index("| 6 | !!! 交房租 |")
+            < md.index("| 5 | !! 整理财报 |")
+            < md.index("| 4 | 买鸡蛋 |"))
+
+
+def test_priority_marks_show_up_in_png_html():
+    page, *_ = build_today_html(
+        [entry("交房租", number=3, kind="inbox", priority="high")], now=NOW)
+    assert "!!! 交房租" in visible(page)
+
+
+def test_task_priority_mark_shows_in_today_and_next_sections():
+    md = render_today_markdown([entry("今天交材料", number=1, priority="high"),
+                                later("周五的事", number=2, days=4, priority="medium")],
+                               now=NOW)
+    assert "!!! 今天交材料" in md and "!! 周五的事" in md
+
+
+def test_view_json_reports_priority():
+    data = json.loads(render_today_json(
+        [entry("交房租", number=4, kind="inbox", priority="high")], now=NOW))
+    assert data["inbox"][0]["priority"] == "high"
+
+
+def test_board_order_puts_important_inbox_thoughts_first():
+    entries = [entry("普通念头", number=4, kind="inbox"),
+               entry("重要念头", number=5, kind="inbox", priority="high")]
+    assert [e.title for e in board_order(entries, now=NOW)][-2:] == ["重要念头", "普通念头"]

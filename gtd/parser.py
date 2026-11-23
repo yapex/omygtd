@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
+from . import priority as prio
+
 LIST_DEFAULT = "GTD"
 LIST_WAITING = "Waiting"
 SLOT_AM, SLOT_PM = "am", "pm"
@@ -73,6 +75,18 @@ _FILLERS = ("提醒我一下", "提醒一下", "提醒我", "记得", "别忘了
             "麻烦帮我", "麻烦你", "麻烦")
 _PUNCT = " \t\u3000，。、；：！？,.;:!?…·—～~「」『』“”\"'()（）【】[]"
 
+# ---- 重要性（→ Reminders.app 原生 priority，不走自造布尔标记）
+# 词可以出现在句中或句尾（时间词只剥句首，这个不限制位置），但必须落在一个小句
+# 边界上：否则「重要性分析」「优先股」「不着急」会被剥掉半个标题。
+_STAR_WORD = re.compile(r"重要|着急|急|优先")
+_STAR_URGENT = ("急", "着急")           # 单独出现就是 high（老板的「急」＝最要紧）
+_STAR_LEAD = ("这件事", "这个事", "这个", "这件", "那条", "那件")
+_STAR_DEGREE = ("非常", "特别", "很", "挺", "最")     # 带程度副词 = high
+_STAR_AFTER_BLOCK = {"重要": ("性",), "着急": ("忙",), "急": ("诊", "救", "需", "性"),
+                     "优先": ("股", "率", "权")}
+_STAR_BEFORE_BLOCK = {"重要": ("不", "没", "非", "无"), "着急": ("不", "别", "没"),
+                      "急": ("不", "别", "没")}
+
 
 @dataclass(frozen=True)
 class Parsed:
@@ -83,6 +97,7 @@ class Parsed:
     matched: str = ""                   # 命中的时间原文，便于回显与调试
     list: str = LIST_DEFAULT            # GTD / Waiting
     slot: str | None = None             # 时段标记 am / pm（due 全天 + 闹钟到点响）
+    priority: str = prio.PRIORITY_NONE  # none/low/medium/high（说「重要/急」时置档）
 
     @property
     def all_day(self) -> bool:
@@ -369,6 +384,70 @@ def _resolve_list(text: str) -> tuple[str, list[tuple[int, int]]]:
     return LIST_WAITING, [(found.start(), found.end())]
 
 
+# ---------------------------------------------------------------- 重要性词
+
+def _widen(text: str, start: int) -> int:
+    """吃掉紧贴在前面的「这个 / 很 / 非常」等附着词，返回区间新起点。"""
+    head, moved = start, True
+    while moved:
+        moved = False
+        for prefix in (*_STAR_LEAD, *_STAR_DEGREE):
+            if head >= len(prefix) and text[:head].endswith(prefix):
+                head -= len(prefix)
+                moved = True
+    return head
+
+
+def _edge_ok(text: str, start: int, end: int, *, loose: bool = False) -> bool:
+    """右边是句尾/标点/空白才算小句边界；左边默认同理，``loose`` 时只要求右边。
+
+    ``loose`` 用于带程度副词的「很重要」：哪怕前面是正文（「这个任务很重要」），
+    只剥「很重要」也不会把标题剥坏。
+    """
+    after = text[end:end + 1]
+    if not (end == len(text) or after in _PUNCT or after.isspace()):
+        return False
+    if loose:
+        return True
+    before = text[start - 1:start]
+    return start == 0 or before in _PUNCT or before.isspace()
+
+
+def _star_level(word: str, span: str) -> str:
+    """「急 / 着急」和带程度副词的（很重要、非常急）是 high；光说「重要 / 优先」是 medium。"""
+    if word in _STAR_URGENT or any(deg in span for deg in _STAR_DEGREE):
+        return prio.PRIORITY_HIGH
+    return prio.PRIORITY_MEDIUM
+
+
+def _star_hit(text: str, match: re.Match) -> tuple[int, int, str] | None:
+    """一个「重要/急/优先」词 → (起, 止, 档位)；不在小句边界上就返回 None。"""
+    word, start, end = match.group(0), match.start(), match.end()
+    if text[start - 1:start] in _STAR_BEFORE_BLOCK.get(word, ()):
+        return None                     # 「不着急」「不重要」＝不标
+    if text[end:end + 1] in _STAR_AFTER_BLOCK.get(word, ()):
+        return None                     # 「重要性」「优先股」是正文里的词
+    start = _widen(text, start)
+    if not _edge_ok(text, start, end, loose=text[start:end].startswith(_STAR_DEGREE)):
+        return None
+    return start, end, _star_level(word, text[start:end])
+
+
+def _stars(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """全句的重要性说法 → (优先级, 要剥掉的区间)；多说几个取最高那一档。"""
+    spans: list[tuple[int, int]] = []
+    level = prio.PRIORITY_NONE
+    for match in _STAR_WORD.finditer(text):
+        hit = _star_hit(text, match)
+        if hit is None:
+            continue
+        start, end, value = hit
+        spans.append((start, end))
+        if prio.rank(value) > prio.rank(level):
+            level = value
+    return level, spans
+
+
 def parse(text: str, *, now: datetime) -> Parsed:
     """把一句中文解析成 Reminder 需要的字段；解析不出来不算错。"""
     hits = _scan(text)
@@ -376,12 +455,16 @@ def parse(text: str, *, now: datetime) -> Parsed:
     cut = _strip_hits(text, hits)
     due = _resolve_due(hits, now.date())
     at = _resolve_at(cut)
+    spans = [(hit.start, hit.end) for hit in cut] + extra_spans
+    level, stars = _stars(text)
+    title = _cut_title(text, spans + stars) or _cut_title(text, spans)  # 剥完不许空
     return Parsed(
-        title=_cut_title(text, [(hit.start, hit.end) for hit in cut] + extra_spans),
+        title=title,
         due=due,
         at=at,
         slot=None if at is not None else _resolve_slot(cut),   # 钟点优先于时段词
         advance_minutes=_resolve_advance(hits),
         matched=_echo(text, hits),
         list=list_name,
+        priority=level,
     )

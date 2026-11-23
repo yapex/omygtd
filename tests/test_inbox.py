@@ -329,3 +329,64 @@ def test_24_new_day_starts_from_one(board):
     board.sync({"reminder:c": 1}, day=TODAY)
     assert board.numbered(day=TODAY) == {"reminder:c": 1}
     assert board.numbered(day=YESTERDAY) == {"reminder:a": 1, "reminder:b": 2}, "昨天的图不受影响"
+
+
+# ---------- 优先级：priority 列（与 Reminders.app 同口径的四档） ----------
+
+def test_priority_defaults_to_none(inbox):
+    new_id = inbox.add("给猫买罐头", now=NOW)
+    assert new_id > 0
+    assert inbox.pending()[0]["priority"] == "none"
+
+
+def test_add_with_priority_keeps_it(inbox):
+    inbox.add("给猫买罐头", now=NOW, priority="high")
+    assert inbox.pending()[0]["priority"] == "high"
+
+
+def test_add_unknown_priority_falls_back_to_none(inbox):
+    """认不出的档位一律 none：宁可少标，不许瞎标。"""
+    inbox.add("给猫买罐头", now=NOW, priority="urgent")
+    assert inbox.pending()[0]["priority"] == "none"
+
+
+def test_set_priority_updates_pending(inbox):
+    new_id = inbox.add("给猫买罐头", now=NOW)
+    assert inbox.set_priority(new_id, "medium") is True
+    assert inbox.pending()[0]["priority"] == "medium"
+
+
+def test_set_priority_refuses_moved_row(inbox):
+    """已经迁出收件箱的行不再改优先级（它现在归 Reminder 管）。"""
+    new_id = inbox.add("给猫买罐头", now=NOW)
+    inbox.mark_moved(new_id, "reminder-1", now=NOW)
+    assert inbox.set_priority(new_id, "high") is False
+
+
+def test_readd_within_window_marks_existing_row_important(inbox):
+    """2 分钟内同一句话重说一遍、这次带「重要」→ 补标到原来那一行，不新建。"""
+    first = inbox.add("给猫买罐头", now=NOW)
+    again = inbox.add("给猫买罐头", now=NOW + timedelta(seconds=30), priority="high")
+    assert again == first
+    assert inbox.pending()[0]["priority"] == "high"
+
+
+def test_old_db_gets_priority_column_added(tmp_path):
+    """1.1.0 的老库没有 inbox.priority：连上来先 ALTER 补列，老数据一条不丢。"""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,"
+        " note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, moved_at TEXT,"
+        " reminder_id TEXT);"
+        "INSERT INTO inbox (title, note, created_at)"
+        " VALUES ('旧念头', '', '2026-11-20T09:00:00');")
+    conn.commit()
+    conn.close()
+    box = Inbox(db)
+    try:
+        rows = box.pending()
+        assert [(row["title"], row["priority"]) for row in rows] == [("旧念头", "none")]
+        assert box.set_priority(rows[0]["id"], "high") is True
+    finally:
+        box.close()

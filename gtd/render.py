@@ -25,6 +25,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Protocol
 
+from . import priority as prio
+
 WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 CHROME_CANDIDATES = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -719,6 +721,7 @@ class Entry:
     ref: str = ""                     # reminder:<id> / inbox:<id>，给 board_index 用
     all_day: bool = False             # Reminder 里的全天条目（at 必为 None）
     alarm: time | None = None         # 全天的闹钟时刻（「12:00 响」），仅用于回显
+    priority: str = prio.PRIORITY_NONE   # none/low/medium/high（显示成 ! / !! / !!!）
 
 
 def _future(entry: Entry, today: date) -> bool:
@@ -747,13 +750,17 @@ def _upcoming(entry: Entry, today: date) -> bool:
 def _split_today(entries: list[Entry], today: date):
     """上区：有 at 的按时刻升序在前、无 at 的按传入顺序垫后；下区：inbox。
 
-    未来的条目两边都不进——7 天内的归「接下来」，更远的不上图。
+    未来条目两边都不进——7 天内的归「接下来」，更远的不上图。
+    收件箱下区按优先级降序（high → medium → low → none），同档保持传入顺序
+    （命令层按 created_at ASC 给的），所以标了感叹号的念头一定排在前面。
     """
     tasks = _today_rows(entries, today)
     timed = [e for e in tasks if e.at is not None]
     timed.sort(key=lambda e: e.at or time(0, 0))
     untimed = [e for e in tasks if e.at is None]
-    return timed + untimed, [e for e in entries if e.kind == "inbox"]
+    lower = sorted((e for e in entries if e.kind == "inbox"),
+                   key=lambda e: -prio.rank(e.priority))
+    return timed + untimed, lower
 
 
 def _next_key(entry: Entry):
@@ -788,11 +795,17 @@ def _next_when(entry: Entry) -> str:
     return f"{label} {_when_text(entry)}".strip()
 
 
+def _shown_title(entry: Entry) -> str:
+    """图上/表上的标题：有优先级就在前面加感叹号（high !!!、medium !!、low !）。"""
+    mark = prio.mark(entry.priority)
+    return f"{mark} {entry.title}" if mark else entry.title
+
+
 def _next_row(entry: Entry) -> str:
     """接下来区的一行：号是当天固定的图上号，印在日期前缀左边（同一套样式）。"""
     return ('<div class="row">'
             f'<div class="when"><span class="seq">{entry.number}</span>{html.escape(_next_when(entry))}</div>'
-            f'<div class="title">{html.escape(entry.title)}</div>'
+            f'<div class="title">{html.escape(_shown_title(entry))}</div>'
             f'<div class="list">{html.escape(entry.list_name)}</div>'
             '</div>')
 
@@ -847,7 +860,7 @@ def _entry_row(entry: Entry, now: datetime) -> str:
     return ('<div class="row">'
             f'<div class="seq">{entry.number}</div>'
             f'{_at_html(entry, now)}'
-            f'<div class="title">{html.escape(entry.title)}</div>'
+            f'<div class="title">{html.escape(_shown_title(entry))}</div>'
             f'{_tag_html(entry)}'
             f'<div class="list">{html.escape(entry.list_name)}</div>'
             '</div>')
@@ -861,7 +874,7 @@ def _rows_block(css_class: str, entries: list[Entry], now: datetime) -> str:
 
 
 def _title_lines(entry: Entry) -> int:
-    px = sum(31 if ord(ch) > 127 else 16 for ch in entry.title)
+    px = sum(31 if ord(ch) > 127 else 16 for ch in _shown_title(entry))
     return max(1, math.ceil(px / T_TITLE_W))
 
 
@@ -960,10 +973,11 @@ def _md_summary(entries: list[Entry], today: date) -> str:
 
 
 def _md_title(entry: Entry) -> str:
-    """标题单元格：逾期条目在标题后加「（逾期 N 天）」。"""
+    """标题单元格：优先级感叹号在前，逾期条目在后面加「（逾期 N 天）」。"""
+    head = _shown_title(entry)
     if entry.overdue_days <= 0:
-        return entry.title
-    return f"{entry.title}（逾期 {entry.overdue_days} 天）"
+        return head
+    return f"{head}（逾期 {entry.overdue_days} 天）"
 
 
 def _md_cell(value) -> str:
@@ -1003,14 +1017,15 @@ def render_today_markdown(entries: list[Entry], *, now: datetime) -> str:
     if shown:
         blocks.append(f"{MD_NEXT_LABEL}\n\n{_md_next_block(shown, total)}")
     if lower:
-        rows = [(str(entry.number), entry.title) for entry in lower]
+        rows = [(str(entry.number), _md_title(entry)) for entry in lower]
         blocks.append(f"{MD_INBOX_LABEL}\n\n{_md_table(('标题',), rows)}")
     return "\n\n".join(blocks) + "\n"
 
 
 def _view_item(entry: Entry, when: str) -> dict:
     return {"number": entry.number, "when": when, "title": entry.title,
-            "list": entry.list_name, "overdue_days": entry.overdue_days}
+            "list": entry.list_name, "overdue_days": entry.overdue_days,
+            "priority": prio.normalize(entry.priority)}
 
 
 def render_today_json(entries: list[Entry], *, now: datetime) -> str:

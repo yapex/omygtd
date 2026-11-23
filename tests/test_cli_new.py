@@ -739,3 +739,95 @@ def test_human_list_prints_text_not_json(capsys, db, fake):
     assert "GTD" in text and "2 条（2 未完成）" in text
     assert "Waiting" in text and "1 条（1 未完成）" in text
 
+
+# ---------------------------------------------------------------- priority
+#
+# 老板要的是「和 Reminder 里一致的重要级」：命令词汇照抄 remindctl
+# （none|low|medium|high），只改收件箱条目——今天区/接下来区按日期排，不受影响。
+
+def test_add_recognises_importance_and_strips_the_word(capsys, db, fake):
+    code, data = run(capsys, ["add", "对腾讯Q3财报做综合分析，这个很重要"], db=db, store=fake)
+    assert code == 0 and data["priority"] == "high"
+    assert data["title"] == "对腾讯Q3财报做综合分析" and "重要" not in data["title"]
+    assert Inbox(db).pending()[0]["priority"] == "high"
+
+
+def test_add_priority_flag_overrides_parser(capsys, db, fake):
+    _, data = run(capsys, ["add", "买鸡蛋", "--priority", "low"], db=db, store=fake)
+    assert data["priority"] == "low"
+    assert Inbox(db).pending()[0]["priority"] == "low"
+
+
+def test_add_timed_task_writes_priority_into_reminder(capsys, db, fake):
+    _, data = run(capsys, ["add", "明天中午前交材料，很重要"], db=db, store=fake)
+    assert data["source"] == "reminder" and data["priority"] == "high"
+    assert fake.all()[0]["priority"] == "high"
+
+
+def test_priority_command_marks_inbox_row_and_sorts_it_first(capsys, db, fake,
+                                                             tmp_path, monkeypatch):
+    run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
+    run(capsys, ["add", "想给家里买个加湿器"], db=db, store=fake)
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1, 2]
+    code, data = run(capsys, ["priority", "2", "high"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["priority"] == "high" and data["mark"] == "!!!"
+    assert Inbox(db).pending()[1]["priority"] == "high"
+    _, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert text.index("| 2 | !!! 想给家里买个加湿器 |") < text.index("| 1 | 买鸡蛋 |")
+
+
+def test_priority_none_clears_the_mark(capsys, db, fake, tmp_path, monkeypatch):
+    run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    run(capsys, ["priority", "1", "medium"], db=db, store=fake)
+    _, marked = run_text(capsys, ["view"], db=db, store=fake)
+    assert "| 1 | !! 买鸡蛋 |" in marked
+    code, data = run(capsys, ["priority", "1", "none"], db=db, store=fake)
+    assert code == 0 and data["mark"] == ""
+    _, cleared = run_text(capsys, ["view"], db=db, store=fake)
+    assert "| 1 | 买鸡蛋 |" in cleared and "!" not in cleared
+
+
+def test_priority_rejects_level_outside_the_four(capsys, db, fake, tmp_path, monkeypatch):
+    run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    code, data = run(capsys, ["priority", "1", "garbage"], db=db, store=fake)
+    assert code == 1 and data["ok"] is False
+    assert "none/low/medium/high" in data["error"]
+
+
+def test_priority_rejects_a_reminder_number(capsys, db, fake, tmp_path, monkeypatch):
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
+    code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
+    assert code == 1 and "只有收件箱条目能设优先级" in data["error"]
+
+
+def test_priority_rejects_unknown_number(capsys, db, fake, tmp_path, monkeypatch):
+    run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    code, data = run(capsys, ["priority", "99", "high"], db=db, store=fake)
+    assert code == 1 and "今天没有 99 号" in data["error"]
+
+
+def test_priority_keeps_board_numbers_stable_across_views(capsys, db, fake,
+                                                          tmp_path, monkeypatch):
+    """排序会变、号不许变：两边的号都来自 board_index 的当天映射。"""
+    run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
+    run(capsys, ["add", "想给家里买个加湿器"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    run(capsys, ["priority", "2", "high"], db=db, store=fake)
+    _, first = run_text(capsys, ["view"], db=db, store=fake)
+    _, second = run_text(capsys, ["view"], db=db, store=fake)
+    assert md_numbers(first) == md_numbers(second) == [2, 1]
+    assert board_rows(db) == [(1, "inbox:1"), (2, "inbox:2")]
+
+
+def test_clarify_carries_inbox_priority_into_reminder(capsys, db, fake):
+    run(capsys, ["add", "对腾讯Q3财报做综合分析，这个很重要"], db=db, store=fake)
+    row_id = Inbox(db).pending()[0]["id"]
+    code, data = run(capsys, ["clarify", str(row_id), "明天下午"], db=db, store=fake)
+    assert code == 0 and data["priority"] == "high"
+    assert fake.all()[0]["priority"] == "high", "clarify 之后 Reminder 里也要带 high"
+
