@@ -141,7 +141,7 @@ def test_board_renders_png_cross_process(tmp_path):
     data = json.loads(proc.stdout)
     assert data["ok"] is True
     assert data["path"] == str(out)
-    assert data["count"] == 2 and data["overdue"] == 1   # 今天 + 逾期；明天的在外
+    assert data["count"] == 3 and data["overdue"] == 1   # 今天 + 逾期 + 明天（接下来区）
     assert out.exists() and out.stat().st_size > PNG_MIN_BYTES
 
 

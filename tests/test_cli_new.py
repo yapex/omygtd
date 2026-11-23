@@ -214,47 +214,85 @@ def test_clarify_unknown_id_reports_error(capsys, db, fake):
 
 
 # ---------------------------------------------------------------- done
+#
+# 号全来自 board_index（今天的图上号）。所以每个用例都先出一张假图，
+# 再按图上的号 `done`——跟老板的说法一致：「图上的 3 号」。
 
-def test_done_completes_reminder_by_seq(capsys, db, fake):
-    _, added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
-    code, data = run(capsys, ["done", str(added["seq"])], db=db, store=fake)
+def fake_board(capsys, db, store, tmp_path, monkeypatch) -> dict:
+    """出一张假图（替掉真 Chrome），返回载荷（含 numbers）。"""
+    monkeypatch.setattr(cli.render, "render_today", stub_render())
+    return run(capsys, ["board", "--out", str(tmp_path / "b.png")],
+               db=db, store=store)[1]
+
+
+def test_done_completes_the_number_on_the_board(capsys, db, fake, tmp_path, monkeypatch):
+    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
+    code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     result = data["results"][0]
     assert result["ok"] is True and result["ref"] == f"reminder:{added['reminder_id']}"
     assert fake.all()[0]["isCompleted"] is True
 
 
-def test_done_completes_multiple_seqs(capsys, db, fake):
+def test_done_completes_multiple_numbers(capsys, db, fake, tmp_path, monkeypatch):
     run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
     run(capsys, ["add", "后天下午回邮件"], db=db, store=fake)
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1, 2]
     code, data = run(capsys, ["done", "1", "2"], db=db, store=fake)
     assert code == 0 and [item["seq"] for item in data["results"]] == [1, 2]
     assert all(item["ok"] for item in data["results"])
     assert all(item["isCompleted"] for item in fake.all())
 
 
-def test_done_unknown_seq_reports_error_without_crashing(capsys, db, fake):
+def test_done_without_board_says_take_a_look_first(capsys, db, fake):
+    """今天还没出过图 → 不许按 daily_seq 瞎猜，直接让人先看图。"""
+    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    code, data = run(capsys, ["done", "1"], db=db, store=fake)
+    assert code == 1 and data["results"][0]["ok"] is False
+    assert "先看一眼看板" in data["results"][0]["error"]
+    assert not any(item["isCompleted"] for item in fake.all()), "一条都不许动"
+
+
+def test_done_unknown_number_reports_error_without_crashing(capsys, db, fake,
+                                                            tmp_path, monkeypatch):
+    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
     code, data = run(capsys, ["done", "99"], db=db, store=fake)
     assert code == 1 and data["ok"] is False
-    assert data["results"][0]["ok"] is False and "没有" in data["results"][0]["error"]
+    assert data["results"][0]["ok"] is False
+    assert data["results"][0]["error"] == "今天没有 99 号"
 
 
-def test_done_on_inbox_seq_marks_moved(capsys, db, fake):
+def test_done_on_inbox_number_marks_moved(capsys, db, fake, tmp_path, monkeypatch):
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 0 and data["results"][0]["source"] == "inbox"
     assert Inbox(db).pending() == []
 
 
-def test_done_on_already_clarified_seq_says_where_to_look(capsys, db, fake):
-    """clarify 之后旧号还指着那条已迁出的念头：报清楚，别静默失败。"""
+def test_done_on_already_clarified_inbox_number_says_where_to_look(capsys, db, fake,
+                                                                   tmp_path, monkeypatch):
+    """出图后把那条念头 clarify 走了：图上号还指着它，要报清楚而不是静默失败。"""
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
     row_id = Inbox(db).pending()[0]["id"]
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
     run(capsys, ["clarify", "1", "明天下午"], db=db, store=fake)
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 1 and data["results"][0]["ok"] is False
     assert data["results"][0]["ref"] == f"inbox:{row_id}"
-    assert "已经迁出" in data["results"][0]["error"]
+    assert "已经迁出收件箱" in data["results"][0]["error"]
+
+
+def test_done_refuses_when_reminder_completed_on_phone(capsys, db, fake, tmp_path,
+                                                       monkeypatch):
+    """图上出完之后在手机上完成了这条：号还在，但不能再做一次。"""
+    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    fake.complete(fake.all()[0]["id"])
+    code, data = run(capsys, ["done", "1"], db=db, store=fake)
+    assert code == 1 and "已经完成" in data["results"][0]["error"]
 
 
 # ---------------------------------------------------------------- board
@@ -287,11 +325,100 @@ def test_board_counts_match_data(capsys, db, fake, tmp_path, monkeypatch):
     out = tmp_path / "today.png"
     code, data = run(capsys, ["board", "--out", str(out)], db=db, store=fake)
     assert code == 0 and data["ok"] is True
-    assert data["count"] == 3 and data["overdue"] == 1 and data["inbox"] == 1
+    assert data["count"] == 4 and data["overdue"] == 1 and data["inbox"] == 1
     assert data["path"] == str(out) and out.exists()
-    assert len(seen["entries"]) == 3
+    assert len(seen["entries"]) == 4
     assert [entry.title for entry in seen["entries"]][0] == "今天交材料"
+    assert seen["entries"][2].due.isoformat() == "2026-11-24"   # 明天进「接下来」区，带日期
     assert seen["entries"][-1].kind == "inbox"
+
+
+def test_board_passes_seven_day_window_to_render(capsys, db, fake, tmp_path, monkeypatch):
+    """窗口边界：7 天内（含第 7 天）的条目传给 render（进「接下来」区），第 8 天的不传。"""
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("第七天的事", datetime(2026, 11, 30, 12, 0), "GTD")
+    fake.add("第八天的事", datetime(2026, 12, 1, 12, 0), "GTD")
+    seen = {}
+
+    def fake_render(entries, *, now, out_path):
+        seen["entries"] = entries
+        Path(out_path).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return Path(out_path)
+
+    monkeypatch.setattr(cli.render, "render_today", fake_render)
+    code, data = run(capsys, ["board", "--out", str(tmp_path / "x.png")], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    titles = [entry.title for entry in seen["entries"]]
+    assert titles == ["今天交材料", "第七天的事"], titles
+
+
+# ---------------------------------------------------------------- 图上号（board_index）
+#
+# 硬要求：当天编号幂等。同样的数据反复出图，号一个字都不许变；新增追加到末尾；
+# 删掉的号不回收、其余不重排。
+
+def board_rows(db):
+    """今天的映射（按号排）：[(号, 引用)]，用来断言「号没动」。"""
+    return [(row["display_seq"], row["reminder_id"])
+            for row in rows(db, "select display_seq, reminder_id from board_index "
+                                "where day='2026-11-23' order by display_seq")]
+
+
+def test_board_numbers_are_idempotent_across_five_runs(capsys, db, fake, out_dir,
+                                                      monkeypatch):
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
+    fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("丙", datetime(2026, 11, 27, 15, 30), "GTD")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    first = run(capsys, ["board"], db=db, store=fake)[1]["numbers"]
+    snapshot = board_rows(db)
+    later = [run(capsys, ["board"], db=db, store=fake)[1]["numbers"] for _ in range(4)]
+    assert first == [1, 2, 3] and later == [[1, 2, 3]] * 4, (first, later)
+    assert board_rows(db) == snapshot, "映射行一个字节都不许变"
+
+
+def test_board_keeps_old_numbers_and_appends_new(capsys, db, fake, out_dir, monkeypatch):
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
+    fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 2]
+    fake.add("丙", datetime(2026, 11, 23, 8, 0), "GTD")     # 今早，图上排最前面
+    data = run(capsys, ["board"], db=db, store=fake)[1]
+    assert data["numbers"] == [3, 1, 2], "老号不动，新条目拿 max+1=3（哪怕它排最前）"
+
+
+def test_board_drops_deleted_numbers_without_renumbering(capsys, db, fake, out_dir,
+                                                         monkeypatch):
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
+    gone = fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("丙", datetime(2026, 11, 23, 15, 0), "GTD")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 2, 3]
+    fake.delete(gone)
+    assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 3], "2 号空着不填补"
+    fake.add("丁", datetime(2026, 11, 23, 16, 0), "GTD")
+    assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 3, 4]
+
+
+def test_board_leaves_daily_seq_alone(capsys, db, fake, out_dir, monkeypatch):
+    """图上号与 daily_seq 是两套：出图不许改 daily_seq 一行。"""
+    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    before = rows(db, "select day, seq, ref from daily_seq order by seq")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    run(capsys, ["board"], db=db, store=fake)
+    run(capsys, ["board"], db=db, store=fake)
+    assert rows(db, "select day, seq, ref from daily_seq order by seq") == before
+
+
+def test_board_numbers_only_what_is_drawn(capsys, db, fake, out_dir, monkeypatch):
+    """接下来区只露 5 条：第 6、7 条不上图，也就不占号（也不许崩）。"""
+    for day in range(1, 8):
+        fake.add(f"第{day}天的事", datetime(2026, 11, 23 + day, 9, 0), "GTD")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    code, data = run(capsys, ["board"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["numbers"] == [1, 2, 3, 4, 5] and data["count"] == 5
+    assert len(board_rows(db)) == 5
 
 
 # ---------------------------------------------------------------- board → mirror
@@ -306,7 +433,7 @@ def test_board_rebuilds_mirror_with_all_open_reminders(capsys, db, fake, tmp_pat
     code, data = run(capsys, ["board", "--out", str(out)], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert "warnings" not in data
-    assert data["count"] == 2 and data["inbox"] == 1   # 今天那条 + 1 条 inbox
+    assert data["count"] == 3 and data["inbox"] == 1   # 今天那条 + 明天那条（接下来区）+ 1 条 inbox
     assert mirror_ids(db) == sorted([today, later])
     assert len(mirror_ids(db)) == len(fake.all()) == 2
 

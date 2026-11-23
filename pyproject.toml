@@ -1,6 +1,6 @@
 [project]
 name = "gtd"
-version = "1.0.0"
+version = "1.1.0"
 description = "单人 GTD 系统 MVP-1：本地 SQLite 真相源 + 看板 PNG 渲染"
 readme = "README.md"
 requires-python = ">=3.10"

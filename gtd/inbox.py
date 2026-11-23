@@ -6,8 +6,10 @@
    ``reminder_id``，Reminder 那边出问题还能查到原始记录。
 2. ``daily_seq``：当天序号，可断号、不重复、只当天有效。
 3. ``mirror``：Reminder 的本地副本，**可整表重建**（备份，不是真相源）。
+4. ``board_index``：**最近一次出图的「图上号 → 条目引用」映射**（每次出图整批重写）。
+   老板只记「图上的 3 号」，`done 3` 靠这张表反查是哪条；出图成功之后才写。
 
-三张表同一个库文件（默认 ``data/gtd.db``）。本模块只管读写与事务：不打印、
+四张表同一个库文件（默认 ``data/gtd.db``）。本模块只管读写与事务：不打印、
 不解析参数、不认识渲染格式。所有 ``now`` / ``day`` 都可注入，测试不依赖系统时钟。
 
 另有一张内部辅助表 ``daily_seq_hwm``（当日序号高水位）：只为了「删掉行之后号也不
@@ -59,6 +61,17 @@ CREATE TABLE IF NOT EXISTS mirror (
   completed   INTEGER NOT NULL DEFAULT 0,
   synced_at   TEXT NOT NULL
 );
+
+-- 图上的号 → 条目。**当天不变**（幂等）：已有行原样保留，新条目只有 INSERT，
+-- 消失的条目才 DELETE；号一律 max(display_seq)+1。跨天按新的一天重新分配。
+-- 列名照老板给的 schema 叫 reminder_id，内容沿用全局 ref 口径：
+-- ``reminder:<uuid>`` 或 ``inbox:<行 id>``。
+CREATE TABLE IF NOT EXISTS board_index (
+  day         TEXT    NOT NULL,
+  display_seq INTEGER NOT NULL,
+  reminder_id TEXT    NOT NULL,
+  PRIMARY KEY (day, display_seq)
+);
 """
 
 MIRROR_COLS = ("reminder_id", "title", "list_name", "due_at", "completed", "synced_at")
@@ -70,6 +83,7 @@ TABLE_COLUMNS = {
     "daily_seq": ("day", "seq", "ref"),
     "daily_seq_hwm": ("day", "last_seq"),
     "mirror": MIRROR_COLS,
+    "board_index": ("day", "display_seq", "reminder_id"),
 }
 
 
@@ -286,3 +300,64 @@ class Mirror(_LocalTable):
             "SELECT reminder_id, title, list_name, due_at, completed, synced_at "
             "FROM mirror ORDER BY reminder_id").fetchall()
         return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------- board_index
+
+class BoardIndex(_LocalTable):
+    """图上号 → 条目。当天不变：已有号原样保留，新的只有 INSERT，消失的才 DELETE。
+
+    幂等是硬要求：同样的数据反复出图，号一个字都不许变。所以这里**绝不整表重建**，
+    也不读列表下标——新号唯一的来源是 ``next_number()``（``max(display_seq)+1``）。
+    """
+
+    def numbered(self, *, day=None) -> dict[str, int]:
+        """当天已有的「条目引用 → 图上号」。"""
+        rows = self._db().execute(
+            "SELECT display_seq, reminder_id FROM board_index WHERE day=?",
+            (_day_key(day),)).fetchall()
+        return {row["reminder_id"]: row["display_seq"] for row in rows}
+
+    def next_number(self, *, day=None) -> int:
+        """下一个可用号：``max(display_seq)+1``（空表从 1 开始）。"""
+        key = _day_key(day)
+        row = self._db().execute(
+            "SELECT COALESCE(MAX(display_seq), 0) AS top FROM board_index WHERE day=?",
+            (key,)).fetchone()
+        return int(row["top"]) + 1
+
+    def lookup(self, number, *, day=None) -> str | None:
+        """图上第 number 号 → 条目引用；这张图上没有这个号就 None。"""
+        row = self._db().execute(
+            "SELECT reminder_id FROM board_index WHERE day=? AND display_seq=?",
+            (_day_key(day), number)).fetchone()
+        return row["reminder_id"] if row is not None else None
+
+    def sync(self, numbers: dict[str, int], *, day=None) -> int:
+        """按 ``{引用: 号}`` 增量对齐当天的映射：保留已有、插入新增、删除消失的。
+
+        已在表里的号**一个字段都不改**（不 UPDATE），所以重复调用是幂等的。
+        """
+        key = _day_key(day)
+        conn = self._db()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            known = {row["reminder_id"] for row in conn.execute(
+                "SELECT reminder_id FROM board_index WHERE day=?", (key,))}
+            gone = known - set(numbers)
+            fresh = [(key, number, ref) for ref, number in numbers.items()
+                     if ref not in known]
+            conn.executemany(
+                "DELETE FROM board_index WHERE day=? AND reminder_id=?", [(key, ref) for ref in gone])
+            conn.executemany(
+                "INSERT INTO board_index (day, display_seq, reminder_id) VALUES (?, ?, ?)", fresh)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return len(numbers)
+
+    def count(self, *, day=None) -> int:
+        row = self._db().execute(
+            "SELECT COUNT(*) AS n FROM board_index WHERE day=?", (_day_key(day),)).fetchone()
+        return int(row["n"])

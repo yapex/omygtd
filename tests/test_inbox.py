@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from gtd.inbox import DEFAULT_DB, Inbox, Mirror, Seq
+from gtd.inbox import DEFAULT_DB, BoardIndex, Inbox, Mirror, Seq
 
 NOW = datetime(2026, 11, 23, 9, 0)
 TODAY = date(2026, 11, 23)
@@ -281,3 +281,51 @@ def test_19b_seq_never_regresses_after_rows_are_cleared(seq):
     seq._db().execute("DELETE FROM daily_seq WHERE day=?", (TODAY.isoformat(),))
     assert seq.assign("inbox:3", day=TODAY) == 3
     assert seq.all(day=TODAY) == {3: "inbox:3"}
+
+
+# ---------- 20-24：board_index（图上号，当天幂等） ----------
+
+@pytest.fixture
+def board():
+    b = BoardIndex(":memory:")
+    yield b
+    b.close()
+
+
+def test_20_sync_writes_numbers_and_lookup_reads_back(board):
+    board.sync({"reminder:a": 1, "inbox:7": 2}, day=TODAY)
+    assert board.numbered(day=TODAY) == {"reminder:a": 1, "inbox:7": 2}
+    assert board.lookup(2, day=TODAY) == "inbox:7"
+    assert board.count(day=TODAY) == 2
+
+
+def test_21_sync_twice_is_idempotent(board):
+    numbers = {"reminder:a": 1, "reminder:b": 2}
+    board.sync(numbers, day=TODAY)
+    snapshot = board._db().execute(
+        "SELECT day, display_seq, reminder_id FROM board_index ORDER BY display_seq").fetchall()
+    board.sync(numbers, day=TODAY)
+    again = board._db().execute(
+        "SELECT day, display_seq, reminder_id FROM board_index ORDER BY display_seq").fetchall()
+    assert [tuple(row) for row in again] == [tuple(row) for row in snapshot]
+
+
+def test_22_next_number_is_max_plus_one(board):
+    assert board.next_number(day=TODAY) == 1
+    board.sync({"reminder:a": 1, "reminder:b": 4}, day=TODAY)
+    assert board.next_number(day=TODAY) == 5
+
+
+def test_23_sync_drops_gone_refs_and_keeps_the_rest(board):
+    board.sync({"reminder:a": 1, "reminder:b": 2, "reminder:c": 3}, day=TODAY)
+    board.sync({"reminder:a": 1, "reminder:c": 3}, day=TODAY)
+    assert board.numbered(day=TODAY) == {"reminder:a": 1, "reminder:c": 3}
+    assert board.lookup(2, day=TODAY) is None
+
+
+def test_24_new_day_starts_from_one(board):
+    board.sync({"reminder:a": 1, "reminder:b": 2}, day=YESTERDAY)
+    assert board.next_number(day=TODAY) == 1
+    board.sync({"reminder:c": 1}, day=TODAY)
+    assert board.numbered(day=TODAY) == {"reminder:c": 1}
+    assert board.numbered(day=YESTERDAY) == {"reminder:a": 1, "reminder:b": 2}, "昨天的图不受影响"

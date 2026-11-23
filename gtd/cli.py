@@ -22,13 +22,12 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
-from itertools import count
 from pathlib import Path
 
 from . import __version__, doctor, parser as nlp, render
-from .inbox import DEFAULT_DB, PROJECT_ROOT, Inbox, Mirror, Seq
+from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
 from .reminders import RemindctlAdapter, ReminderStore
 
 EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
@@ -47,10 +46,11 @@ class Result:
 
 @dataclass
 class Context:
-    """一次命令执行的上下文：本地库两个表 + Reminder 存储 + 钉住的时刻。"""
+    """一次命令执行的上下文：本地库四张表 + Reminder 存储 + 钉住的时刻。"""
 
     inbox: Inbox
     seq: Seq
+    board: BoardIndex
     store: ReminderStore
     now: datetime
 
@@ -80,7 +80,7 @@ def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
 def _context(args, store, now) -> Context:
     moment = _moment(now if now is not None else args.now)
     db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
-    return Context(Inbox(db), Seq(db),
+    return Context(Inbox(db), Seq(db), BoardIndex(db),
                    store if store is not None else RemindctlAdapter(), moment)
 
 
@@ -133,11 +133,6 @@ def _seq_of(ctx: Context, ref: str) -> int:
         if known == ref:
             return seq
     return ctx.seq.assign(ref, day=ctx.today)
-
-
-def _numbered(known: dict, counter, ref: str) -> int:
-    """查得到用真号；查不到临时分配一个（只在图里用，不落库）。"""
-    return known[ref] if ref in known else next(counter)
 
 
 def _item_due(item: dict) -> datetime | None:
@@ -287,36 +282,57 @@ def _pending_row(ctx: Context, number: int) -> dict | None:
 def cmd_board(ctx: Context, args) -> Result:
     """今天该看的：Reminder 今天到期（含逾期）+ inbox 全部，出一张图。
 
-    出图**成功之后**顺手整表重建 mirror（``drift`` 于是变成「上次出图以后
-    Reminder 被改过」的信号）。顺序不能反：出图失败就不写镜像，否则会记下
-    一个用户根本没看到的视图。镜像写失败只进 ``warnings``，board 仍然成功。
+    图上号（``board_index``）**当天不变**：老条目沿用上次的号，新条目从
+    ``max(display_seq)+1`` 往后追加，消失的条目只删行、不重排。所以同样的数据
+    连出多少次图，号一个字都不变；`done N` 就能一直指到同一条。
+
+    出图**成功之后**才写：整表重建 mirror（``drift`` 于是变成「上次出图以后
+    Reminder 被改过」的信号）＋ 图上号映射。顺序不能反：出图失败就不写，
+    否则会记下一个用户根本没看到的视图。两处写失败只进 ``warnings``，board 仍成功。
 
     默认落两个文件：唯一名 ``out/board-YYYYMMDD-HHMMSS.png``（``path``，推送用
     它绕开客户端按路径缓存）＋当天最新副本 ``out/today-YYYYMMDD.png``（``latest``，
     供 cron / 人直接引用）。``--out`` 显式给了就只写那一个，``latest`` 为 None。
     """
-    known = {ref: seq for seq, ref in ctx.seq.all(day=ctx.today).items()}
-    counter = count(max(known.values(), default=0) + 1)
     items = _open_items(ctx)                    # 出图与镜像共用这一份，不读两遍
-    tasks = _today_tasks(ctx, items, known, counter)
-    loose = _inbox_entries(ctx, known, counter)
-    entries = tasks + loose
+    loose = _inbox_entries(ctx)
+    entries = _today_tasks(ctx, items) + loose
+    order = render.board_order(entries, now=ctx.now)      # 图上从上到下
+    numbers = _board_numbers(ctx, order)                 # 引用 → 当天固定的图上号
+    numbered = [replace(entry, number=numbers.get(entry.ref, entry.number))
+                for entry in entries]     # 没上图（超过 5 条）的条目不会印出来
     explicit = Path(args.out).expanduser() if args.out else None
     out = explicit or _unique_out(datetime.now())      # 时刻取本地墙钟，不是 UTC
     out.parent.mkdir(parents=True, exist_ok=True)
-    path = render.render_today(entries, now=ctx.now, out_path=out)
+    path = render.render_today(numbered, now=ctx.now, out_path=out)
     latest = None if explicit else _default_out(ctx.today)
     if latest is not None:                     # 实体副本（copy2），不用软链
         latest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, latest)
     payload = {"ok": True, "path": str(path), "latest": str(latest) if latest else None,
-               "count": len(entries),
-               "overdue": sum(1 for entry in entries if entry.overdue_days > 0),
-               "inbox": len(loose)}
-    warnings = _mirror_after_board(ctx, items)
+               "count": len(order),
+               "overdue": sum(1 for entry in order if entry.overdue_days > 0),
+               "inbox": sum(1 for entry in order if entry.kind == "inbox"),
+               "numbers": [numbers[entry.ref] for entry in order]}
+    warnings = _persist_board(ctx, items, numbers)
     if warnings:
         payload["warnings"] = warnings
     return Result(payload)
+
+
+def _board_numbers(ctx: Context, order) -> dict[str, int]:
+    """按今天的映射给每条挑号：已有的原样沿用，没有的从 max+1 往后追加。
+
+    ``order`` 是图上从上到下的顺序——只影响**新号**的先后，老号不会被它拉动。
+    """
+    known = ctx.board.numbered(day=ctx.today)
+    numbers = {entry.ref: known[entry.ref] for entry in order if entry.ref in known}
+    nxt = ctx.board.next_number(day=ctx.today)
+    for entry in order:
+        if entry.ref not in numbers:
+            numbers[entry.ref] = nxt
+            nxt += 1
+    return numbers
 
 
 def _open_items(ctx: Context) -> list[tuple[str, dict]]:
@@ -324,19 +340,37 @@ def _open_items(ctx: Context) -> list[tuple[str, dict]]:
     return [(name, item) for name in LISTS for item in ctx.store.pending(name)]
 
 
-def _today_tasks(ctx: Context, items, known: dict, counter) -> list:
+def _today_tasks(ctx: Context, items) -> list:
+    """今天该看的（含逾期）＋ 未来 7 天内的（图上「接下来」区）；更远的不传。
+
+    未来条目也带上 ``due``：渲染层靠它把「今日」和「接下来」分开，并印出
+    「周五 15:30」这样的日期前缀。窗口宽度取 ``render.NEXT_DAYS``，只在渲染层定义一次。
+    每条都带 ``ref``：图上号就靠它跟 ``board_index`` 对上。
+    """
     rows = []
     for name, item in items:
         due = _item_due(item)
-        if due is None or due.date() > ctx.today:      # 逾期也算「今天该看」
+        if due is None or (due.date() - ctx.today).days > render.NEXT_DAYS:
             continue
         rows.append(render.Entry(
-            seq=_numbered(known, counter, f"reminder:{item.get('id')}"),
+            number=0,                     # 占位：图上号由 _board_numbers 决定
             title=str(item.get("title") or ""),
             at=None if due.time() == time(0, 0) else due.time(),
             list_name=name,
-            overdue_days=max(0, (ctx.today - due.date()).days)))
+            overdue_days=max(0, (ctx.today - due.date()).days),
+            due=due.date(),
+            ref=f"reminder:{item.get('id')}"))
     return rows
+
+
+def _persist_board(ctx: Context, items, numbers: dict[str, int]) -> list[str]:
+    """出图成功后写两处：整表重建镜像 ＋ 对齐图上号映射；失败只返回警告。"""
+    warnings = _mirror_after_board(ctx, items)
+    try:
+        ctx.board.sync(numbers, day=ctx.today)     # 增量：老号不动、新号追加
+    except Exception as exc:      # noqa: BLE001 —— 号映射写坏了只是 done 用不了
+        warnings.append(f"看板编号映射写入失败：{exc}")
+    return warnings
 
 
 def _mirror_after_board(ctx: Context, items) -> list[str]:
@@ -359,17 +393,21 @@ def _mirror_row(name: str, item: dict) -> dict:
             "synced_at": None}       # 让 replace_all 用注入的 now 盖章
 
 
-def _inbox_entries(ctx: Context, known: dict, counter) -> list:
-    return [render.Entry(seq=_numbered(known, counter, f"inbox:{row['id']}"),
-                         title=row["title"], at=None, list_name=INBOX_LIST_LABEL,
-                         overdue_days=0, kind=INBOX_LIST_LABEL)
+def _inbox_entries(ctx: Context) -> list:
+    return [render.Entry(number=0, title=row["title"], at=None, list_name=INBOX_LIST_LABEL,
+                         overdue_days=0, kind=INBOX_LIST_LABEL,
+                         ref=f"inbox:{row['id']}")
             for row in ctx.inbox.pending()]
 
 
 # ---------------------------------------------------------------- done
 
 def cmd_done(ctx: Context, args) -> Result:
-    """按当日序号完成；逐条报结果，有一条不行就算业务失败。"""
+    """按**图上的号**完成；逐条报结果，有一条不行就算业务失败。
+
+    号来自 ``board_index``（今天的图，当天不变）。今天还没出过图就报「先看一眼看板」，
+    图上没有这个号就报「今天没有 N 号」——绝不猜、不退回去用别处的号。
+    """
     results = [_done_one(ctx, raw) for raw in args.seqs]
     return Result({"ok": all(item["ok"] for item in results), "results": results},
                   code=EXIT_OK if all(item["ok"] for item in results) else EXIT_FAIL)
@@ -377,23 +415,51 @@ def cmd_done(ctx: Context, args) -> Result:
 
 def _done_one(ctx: Context, raw) -> dict:
     try:
-        seq = int(raw)
+        number = int(raw)
     except (TypeError, ValueError):
         return {"seq": raw, "ok": False, "error": "序号不是整数"}
-    ref = ctx.seq.lookup(seq, day=ctx.today)
+    ref, problem = _board_ref(ctx, number)
+    if problem or ref is None:
+        return {"seq": number, "ok": False, "error": problem or f"今天没有 {number} 号"}
+    return _complete_ref(ctx, number, ref)
+
+
+def _board_ref(ctx: Context, number: int) -> tuple[str | None, str | None]:
+    """图上号 → (引用, 拒绝原因)。"""
+    if ctx.board.count(day=ctx.today) == 0:
+        return None, "今天还没出过图，先看一眼看板"
+    ref = ctx.board.lookup(number, day=ctx.today)
     if ref is None:
-        return {"seq": seq, "ok": False, "error": "今天的号里没有这一个"}
+        return None, f"今天没有 {number} 号"
+    return ref, None
+
+
+def _complete_ref(ctx: Context, number: int, ref: str) -> dict:
     kind, _, target = ref.partition(":")
     if kind == "reminder":
+        gone = _reminder_problem(ctx, target)
+        if gone:
+            return {"seq": number, "ok": False, "ref": ref, "error": gone}
         ok = bool(ctx.store.complete(target))
-        item = {"seq": seq, "ok": ok, "ref": ref, "source": "reminder"}
+        item = {"seq": number, "ok": ok, "ref": ref, "source": "reminder"}
         return item if ok else {**item, "error": "Reminder 完成失败"}
-    if kind == INBOX_LIST_LABEL:          # 理论上不会出现，出现了也不能崩
+    if kind == INBOX_LIST_LABEL:          # 收件箱的号：done 就是「处理掉了」
         if ctx.inbox.mark_moved(target, "", now=ctx.now):
-            return {"seq": seq, "ok": True, "ref": ref, "source": INBOX_LIST_LABEL}
-        return {"seq": seq, "ok": False, "ref": ref, "source": INBOX_LIST_LABEL,
-                "error": "这条念头已经迁出收件箱（clarify 之后会拿到新号，看图上的新号）"}
-    return {"seq": seq, "ok": False, "ref": ref, "error": f"不认识的引用 {ref}"}
+            return {"seq": number, "ok": True, "ref": ref, "source": INBOX_LIST_LABEL}
+        return {"seq": number, "ok": False, "ref": ref, "source": INBOX_LIST_LABEL,
+                "error": "这条念头已经迁出收件箱了（看图上的新号）"}
+    return {"seq": number, "ok": False, "ref": ref, "error": f"不认识的引用 {ref}"}
+
+
+def _reminder_problem(ctx: Context, reminder_id: str) -> str | None:
+    """图上那条在 Reminder 里还在不在、是不是已经做掉了（手机上完成会这样）。"""
+    for item in ctx.store.all():
+        if str(item.get("id")) != reminder_id:
+            continue
+        if item.get("isCompleted"):
+            return "这条已经完成了，重新看图"
+        return None
+    return "这条已经不在 Reminder 里了，重新看图"
 
 
 # ---------------------------------------------------------------- list

@@ -686,38 +686,108 @@ T_ROW_PAD = 20
 T_FOOT_H = 84
 T_GAP = 34
 T_SAFETY = 16
-T_SEQ_W, T_AT_W, T_LIST_W = 54, 92, 150
+T_SEQ_W, T_AT_W, T_LIST_W = 54, 146, 110
 T_TAG_W = 130
 T_TITLE_W = T_WIDTH - T_PAD_X * 2 - T_SEQ_W - T_AT_W - T_LIST_W - T_TAG_W
+NEXT_LIMIT = 5                   # 「接下来」区最多 5 条，超出折一行「还有 N 条」
+NEXT_DAYS = 7                    # 未来 7 天以内（含第 7 天）才进「接下来」
+T_WHEN_W = T_SEQ_W + T_AT_W      # 200：「号 + 周五 15:30」正好占序号 + 时刻两列
+T_NEXT_LABEL_H = 40
+T_MORE_H = 34
 
 
 @dataclass(frozen=True)
 class Entry:
-    """今日视图的一行。seq 由 inbox.Seq 分配，渲染层只显示、不重排。"""
+    """今日视图的一行。
 
-    seq: int
+    ``number`` 是**图上号**，由命令层从 ``board_index`` 取（当天不变、幂等）；
+    渲染层只负责印出来，绝不自己编号。``ref`` 是这条背后是谁
+    （``reminder:<id>`` / ``inbox:<id>``）：渲染层不用它，命令层拿 ``board_order()``
+    写「图上号 → 引用」映射，`done` 靠映射反查。
+    """
+
+    number: int
     title: str
     at: time | None
     list_name: str
     overdue_days: int                 # 0 = 不逾期
     kind: str = "task"                # task | inbox
+    due: date | None = None           # 这条属于哪天；渲染层据此分「今日」与「接下来」
+    ref: str = ""                     # reminder:<id> / inbox:<id>，给 board_index 用
 
 
-def _split_today(entries: list[Entry]):
-    """上区：有 at 的按时刻升序在前、无 at 的按传入顺序垫后；下区：inbox。"""
-    tasks = [e for e in entries if e.kind != "inbox"]
+def _future(entry: Entry, today: date) -> bool:
+    """今天之后的条目（不管多远）。"""
+    return entry.kind != "inbox" and entry.due is not None and entry.due > today
+
+
+def _upcoming(entry: Entry, today: date) -> bool:
+    """今天之后、7 天以内（含第 7 天）的未完成条目 → 进「接下来」区。"""
+    if entry.due is None or not _future(entry, today):
+        return False
+    return (entry.due - today).days <= NEXT_DAYS
+
+
+def _split_today(entries: list[Entry], today: date):
+    """上区：有 at 的按时刻升序在前、无 at 的按传入顺序垫后；下区：inbox。
+
+    未来的条目两边都不进——7 天内的归「接下来」，更远的不上图。
+    """
+    tasks = [e for e in entries if e.kind != "inbox" and not _future(e, today)]
     timed = [e for e in tasks if e.at is not None]
     timed.sort(key=lambda e: e.at or time(0, 0))
     untimed = [e for e in tasks if e.at is None]
     return timed + untimed, [e for e in entries if e.kind == "inbox"]
 
 
-def _top_bar_html(entries: list[Entry]) -> str:
-    """顶栏三格：今天总件数 / 逾期件数 / 收件箱条数。"""
+def _next_key(entry: Entry):
+    """due 升序；同日按 at 升序、无时刻的排当天末尾。"""
+    return (entry.due, 0 if entry.at is not None else 1, entry.at or time(0, 0))
+
+
+def _next_pick(entries: list[Entry], today: date):
+    """「接下来」区的内容：(前 NEXT_LIMIT 条, 总条数)。"""
+    items = sorted((e for e in entries if _upcoming(e, today)), key=_next_key)
+    return items[:NEXT_LIMIT], len(items)
+
+
+def _next_when(entry: Entry) -> str:
+    """日期前缀「周五 15:30」：一眼看出是哪天；无时刻只写星期。"""
+    label = WEEKDAY_CN[entry.due.weekday()] if entry.due else ""
+    if entry.at is None:
+        return label
+    return f"{label} {entry.at.strftime('%H:%M')}".strip()
+
+
+def _next_row(entry: Entry) -> str:
+    """接下来区的一行：号是当天固定的图上号，印在日期前缀左边（同一套样式）。"""
+    return ('<div class="row">'
+            f'<div class="when"><span class="seq">{entry.number}</span>{html.escape(_next_when(entry))}</div>'
+            f'<div class="title">{html.escape(entry.title)}</div>'
+            f'<div class="list">{html.escape(entry.list_name)}</div>'
+            '</div>')
+
+
+def _next_block(shown: list[Entry], total: int):
+    """「接下来」区；没有条目时整区不渲染（返回空串，连标题都不留）。"""
+    if not shown:
+        return "", 0
+    rows = "".join(_next_row(entry) for entry in shown)
+    extra = total - len(shown)
+    note = f'<div class="more">还有 {extra} 条</div>' if extra > 0 else ""
+    height = T_NEXT_LABEL_H + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in shown)
+    height += T_MORE_H if extra > 0 else 0
+    return (f'<div class="next"><div class="label">接下来</div>{rows}{note}</div>',
+            height)
+
+
+def _top_bar_html(entries: list[Entry], today: date) -> str:
+    """顶栏三格：今天总件数 / 逾期件数 / 收件箱条数。接下来的不计入「今天」。"""
     sep = '<span class="sep">·</span>'
-    total, inbox = len(entries), sum(1 for e in entries if e.kind == "inbox")
-    overdue = sum(1 for e in entries if e.overdue_days > 0)
-    return (f'<div class="top">今天 <b>{total}</b> 件{sep}'
+    todays = [e for e in entries if not _future(e, today)]
+    inbox = sum(1 for e in entries if e.kind == "inbox")
+    overdue = sum(1 for e in todays if e.overdue_days > 0)
+    return (f'<div class="top">今天 <b>{len(todays)}</b> 件{sep}'
             f'逾期 <b>{overdue}</b> 件{sep}收件箱 <b>{inbox}</b> 条</div>')
 
 
@@ -739,7 +809,7 @@ def _tag_html(entry: Entry) -> str:
 
 def _entry_row(entry: Entry, now: datetime) -> str:
     return ('<div class="row">'
-            f'<div class="seq">{entry.seq}</div>'
+            f'<div class="seq">{entry.number}</div>'
             f'{_at_html(entry, now)}'
             f'<div class="title">{html.escape(entry.title)}</div>'
             f'{_tag_html(entry)}'
@@ -759,11 +829,13 @@ def _title_lines(entry: Entry) -> int:
     return max(1, math.ceil(px / T_TITLE_W))
 
 
-def _today_estimate(upper: list[Entry], lower: list[Entry]) -> int:
+def _today_estimate(upper: list[Entry], lower: list[Entry], next_h: int = 0) -> int:
     """按行数估高；真实高度由 Chrome 量（见 _measure_height），这里只是兜底。"""
     height = T_PAD_TOP + T_TOP_H + T_FOOT_H + T_PAD_BOTTOM + T_SAFETY
     if upper:
         height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in upper)
+    if next_h:
+        height += T_GAP + next_h
     if lower:
         height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in lower)
     return height
@@ -778,14 +850,36 @@ def _today_document(body: str) -> str:
             '\n</body></html>\n')
 
 
+def _layout(entries: list[Entry], today: date):
+    """图上分区的唯一真相：今日上区 / 接下来（前 5 条 + 总数）/ 收件箱下区。"""
+    upper, lower = _split_today(entries, today)
+    shown, total = _next_pick(entries, today)
+    return upper, shown, total, lower
+
+
+def board_order(entries: list[Entry], *, now: datetime) -> list[Entry]:
+    """图上从上到下的那一份顺序（今日 → 接下来 → 收件箱）。
+
+    图上 1..N 的号就按它排；命令层拿它写「图上号 → ref」映射，`done` 靠映射反查。
+    """
+    upper, shown, _total, lower = _layout(entries, now.date())
+    return upper + shown + lower
+
+
 def build_today_html(entries: list[Entry], *, now: datetime) -> tuple[str, int, int]:
-    """返回 (html, 宽, 高)；高是估算值，render_today 会再用 Chrome 量一次。"""
-    upper, lower = _split_today(entries)
-    body = (_top_bar_html(entries)
+    """返回 (html, 宽, 高)；高是估算值，render_today 会再用 Chrome 量一次。
+
+    区块顺序：今日（含逾期）→ 接下来（未来 7 天，最多 5 条）→ 收件箱。
+    序号直接用 ``Entry.number``（命令层按 board_index 当天固定号给），这里不重排。
+    """
+    upper, shown, total, lower = _layout(entries, now.date())
+    next_html, next_h = _next_block(shown, total)
+    body = (_top_bar_html(entries, now.date())
             + _rows_block("rows", upper, now)
+            + next_html
             + _rows_block("lower", lower, now)
             + f'<div class="foot">只读 · {now.strftime("%H:%M")}</div>')
-    return _today_document(body), T_WIDTH, _today_estimate(upper, lower)
+    return _today_document(body), T_WIDTH, _today_estimate(upper, lower, next_h)
 
 
 def render_today(entries: list[Entry], *, now: datetime, out_path: Path) -> Path:
@@ -871,14 +965,20 @@ TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
   .top .sep { margin: 0 16px; color: #cfc7bd; }
   .rows { margin-top: 34px; }
   .lower { margin-top: 34px; }
+  .next { margin-top: 34px; }
+  .label { font-size: 22px; color: #8a8078; letter-spacing: .14em; margin-bottom: 2px; }
+  .when { width: 200px; flex: none; font-size: 24px; color: #6b6259; white-space: nowrap;
+          font-variant-numeric: tabular-nums; }
+  .when .seq { display: inline-block; width: 54px; }
+  .more { margin-top: 2px; font-size: 22px; color: #a89e94; }
   .row { display: flex; align-items: baseline; padding: 10px 0; }
   .seq { width: 54px; flex: none; font-size: 24px; color: #c3b9ae;
          font-variant-numeric: tabular-nums; }
-  .at { width: 92px; flex: none; font-size: 26px; color: #6b6259;
+  .at { width: 146px; flex: none; font-size: 26px; color: #6b6259;
         font-variant-numeric: tabular-nums; }
   .at.past { color: #b4472e; }
   .title { flex: 1; font-size: 31px; line-height: 1.4; }
   .tag { flex: none; margin-left: 14px; font-size: 20px; color: #b4472e;
          background: #f4ded6; border-radius: 6px; padding: 3px 10px; }
-  .list { width: 150px; flex: none; text-align: right; font-size: 21px; color: #a89e94; }
+  .list { width: 110px; flex: none; text-align: right; font-size: 21px; color: #a89e94; }
   .foot { margin-top: 52px; font-size: 20px; color: #b3a99f; }"""
