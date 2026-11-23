@@ -23,20 +23,32 @@ metadata:
 
 EventKit 经 osascript / python 调用时 TCC 不弹窗（responsible 进程是终端），必须让老板在终端手工授权一次；生产用途要打成签名 .app。
 
-## 命令
+## 命令（v2 实际接口，2026-11-23 用 `gtd add --help` / `gtd board --help` 实测）
 
 ```
-gtd add "<标题>" [--due D] [--slot S] [--category C] [--waiting-on W] [--defer D] [--note T] [--dup-ok]
-gtd clarify <id> --action "<具体动作>" [--due] [--slot] [--category]
-gtd done <id...>          # 支持 gtd done 1 3 4
-gtd drop <id...>
-gtd edit <id> [--title] [--due] [--slot] [--category] [--note]
-gtd show <id>
-gtd board --view <today|inbox|categories> --format <png|md|json> [--out PATH]
-gtd undo / doctor / backup / init / sync
+gtd [--db PATH] [--now WHEN] [--human] <subcommand>
+
+gtd add "<标题>" [--note T]        # 只有 text + --note；没有 --due/--slot/--category
+                                  # 有时间进 Reminder、没时间进收件箱（按文本判）
+gtd inbox                          # 列收件箱里还没迁出的念头
+gtd clarify <id> ...               # 给收件箱念头补时间
+gtd board [--out PATH]             # 只出 today 视图 PNG；没有 --view / --format
+gtd done <id...>
+gtd list                           # Reminder 各列表条数
+gtd doctor                         # 体检：收件箱积压 / Reminder 可用 / 镜像漂移
 ```
 
-默认输出 JSON。退出码：0 成功（含幂等命中）/ 1 参数错 / 2 找不到记录。
+**v1 写法已失效**：`--category`/`--due`/`--slot`/`--waiting-on`/`--defer`/`--dup-ok`、`board --view … --format …`
+以及 `edit`/`show`/`undo`/`backup`/`sync` 在 v2 里都不存在，传了直接 `error: unrecognized arguments`（退出码 2）。
+分类由内部词表自动判（「财报」→ 投资），不需要也不接受手动指定。
+
+全局参数 `--human` 必须写在子命令**前**：`gtd --human add "..."`。
+
+默认输出 JSON。退出码：0 成功（含幂等命中）/ 1 参数错 / 2 找不到记录或参数不认。
+
+## secretary-gate 配额（本机）
+
+执行类工具受 `~/.hermes/agent-hooks/secretary-gate` 管：judge 豁免按动作类扣配额（read 2 / verify 3 / card 不限，TTL 300s），**层 2 每会话累计**用尽后只能 `kanban_create` 派卡重置。教训：一次判态内把所有命令合成**一个** terminal 调用；别用 `--help` 探接口，那会把配额烧在探路上。
 
 ## 触发映射
 
@@ -59,19 +71,21 @@ gtd undo / doctor / backup / init / sync
 
 **不要问**：要不要记、id 是多少、内部字段是什么。他说记就记。
 
-## 记完必回图（2026-11-22 老板定）
+## 记完回文字（2026-11-23 老板改，原「记完必回图」作废）
 
-每次 `gtd add` / `gtd clarify` 成功后，立刻生成更新后的图片视图并发给老板：
+每次 `gtd add` / `gtd clarify` / `gtd done` 成功后，**回文字，不出图**。
 
-```bash
-mkdir -p ~/.hermes/cache/terminal/frog/gtd
-gtd board --view today --format png --out ~/.hermes/cache/terminal/frog/gtd/today-$(date +%F).png
-```
+老板原话：「当我们修改 GTD 之后会返回一个图片，这个动作有点慢，不如直接返回 markdown 文字」
 
-- 回复正文：确认条目（标题 / 时间 / 分类 / id），末尾单独一行 `MEDIA:<png 绝对路径>`。
-- **必须用 today 视图**：它的图含「逾期 / 今日完成 / 收件箱 / 下一步」四区，其中 `下一步` 区**会带上未来日期的条目**（实测 11/27 的条目也显示出来），一屏看全，也正是老板每天 7:00 收到的那张。
-- **`today --format md` 只有当日条目，看不到刚记的未来条目**——别拿 md 顶替，也别据此判断「没记上」。要看文字全量用 `categories --format md`。
-- 写失败时不许拿旧图充数，按「失败时怎么说」三条讲清。
+出图要起 Chrome 渲染，2–3 秒；文字秒出，手机上 Markdown 表格也看得清。
+
+**当前做法**（`gtd view` 尚未落地时的过渡）：
+- 成功 → 回一行确认：图上编号 / 标题 / 时间 / 所在列表，再补一句全局状态（今天几件、收件箱几条）
+- 失败 → 按下面「失败时怎么说」三条讲清
+
+**待落地**：`gtd view` 命令（输出全库 Markdown，编号与 board 图上一致）正在开发。落地后改为跑 `gtd view` 拿全文，直接附在回复里。
+
+**只有老板明说「看图」「看今天的」时才出图**（`gtd board`）。
 
 ## 分类判断
 
