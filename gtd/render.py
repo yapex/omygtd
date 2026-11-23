@@ -693,9 +693,10 @@ T_SEQ_W, T_AT_W, T_LIST_W = 54, 146, 110
 T_TAG_W = 130
 # 列表列留白时不占位：`.title` 是 flex:1，只要不渲染那一块，这 110px 自然归标题。
 # 估高也得按同一口径放大标题宽度，否则行数估多、图上多出空白。
-# 列表名与所处区块重复时不印：GTD 是默认列表（Siri 都写它，每行重复就是噪音），
-# inbox 是收件箱区本身（老板原话「列表 GTD 就没必要再显示了呀」）。
-HIDDEN_LIST_NAMES = frozenset({"GTD", "inbox"})
+# 列表名与所处区块重复时：GTD 是默认列表（Siri 都写它，每行重复就是噪音）→ 留空；
+# 收件箱条目反过来，老板 2026-11-23 要「还是在后面打一个 inbox 标签吧」→ 固定印 `inbox`。
+HIDDEN_LIST_NAMES = frozenset({"GTD"})
+INBOX_LIST_LABEL = "inbox"
 T_TITLE_W = T_WIDTH - T_PAD_X * 2 - T_SEQ_W - T_AT_W - T_LIST_W - T_TAG_W
 NEXT_LIMIT = 5                   # 「接下来」区最多 5 条，超出折一行「还有 N 条」
 NEXT_DAYS = 7                    # 未来 7 天以内（含第 7 天）才进「接下来」
@@ -837,11 +838,13 @@ def _shown_title(entry: Entry) -> str:
 
 
 def list_label(entry: Entry) -> str:
-    """右侧列表列该印的字；``GTD`` 与收件箱条目返回空串（= 不印、不占位）。
+    """右侧列表列该印的字；``GTD`` 返回空串（= 不印、不占位），收件箱条目印 ``inbox``。
 
     PNG 的行与 Markdown 的表格列都调这一处，别再各写一遍（上次分区顺序就是这么出错的）。
     """
-    if entry.kind == "inbox" or entry.list_name in HIDDEN_LIST_NAMES:
+    if entry.kind == "inbox":
+        return INBOX_LIST_LABEL
+    if entry.list_name in HIDDEN_LIST_NAMES:
         return ""
     return entry.list_name
 
@@ -1099,7 +1102,7 @@ def _far_when(entry: Entry) -> str:
 def _md_entry_table(when_head: str, entries: list[Entry], when_fn) -> str:
     """今日/接下来/更远共用的表：``| # | 时刻 | 标题 | [列表] |``。
 
-    「列表」列按 ``list_label()`` 定：整区一条可印的都没有（全 GTD / 全是收件箱）就
+    「列表」列按 ``list_label()`` 定：整区一条可印的都没有（全是 GTD）就
     **整列不出现**（标题自然变宽），有 Waiting 这类的才补上这一列、其余格留空。
     """
     show_list = any(list_label(entry) for entry in entries)
@@ -1129,11 +1132,20 @@ def _md_today_block(upper: list[Entry]) -> str:
 
 
 def _md_inbox_block(lower: list[Entry]) -> str:
-    """收件箱表；空区返回空串。"""
+    """收件箱表；空区返回空串。
+
+    「列表」列同样按 ``list_label()`` 定：收件箱条目现在印 ``inbox``（老板 2026-11-23 要的），
+    所以这一区有自己的表头；哪天规则再变回留空，整列自动消失。
+    """
     if not lower:
         return ""
-    rows = [(str(entry.number), _md_title(entry)) for entry in lower]
-    return f"{MD_INBOX_LABEL}\n\n{_md_table(('标题',), rows)}"
+    show_list = any(list_label(entry) for entry in lower)
+    head = ("标题", "列表") if show_list else ("标题",)
+    rows = []
+    for entry in lower:
+        cells = (str(entry.number), _md_title(entry))
+        rows.append(cells + (list_label(entry),) if show_list else cells)
+    return f"{MD_INBOX_LABEL}\n\n{_md_table(head, rows)}"
 
 
 def _md_sections(entries: list[Entry], now: datetime) -> list[str]:

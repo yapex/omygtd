@@ -659,9 +659,18 @@ def test_json_view_carries_far_items():
 
 # ---------- 15. 列表列瘦身 + 收件箱视觉隔离（2026-11-23） ----------
 #
-# 老板原话：「列表 GTD 就没必要再显示了呀」。GTD 是默认列表（Siri 都写它）、inbox 就是
-# 收件箱区本身，两个名字印在每行右侧都是重复噪音 → 留空且不占位（标题把宽度吃下来）。
-# 收件箱区改成「浅底 + 上方一条细线」的隔离（方案 B），不靠加文字标签提醒。
+# 老板原话：「列表 GTD 就没必要再显示了呀」。GTD 是默认列表（Siri 都写它），名字印在每行
+# 右侧是重复噪音 → 留空且不占位（标题把宽度吃下来）。
+# 收件箱反过来：老板 2026-11-23 说「还是在后面打一个 inbox 标签吧」→ 收件箱条目固定印
+# `inbox`，与「浅底 + 上方一条细线」的视觉隔离并存（一个是文字，一个是底色，不冲突）。
+
+def test_list_label_is_the_single_source_of_the_list_column():
+    """`list_label()` 是唯一判定：GTD 空、收件箱印 inbox、其余（Waiting）原样印。"""
+    from gtd.render import list_label
+    assert list_label(entry("卖出 ≥550 股 SCHO", list_name="GTD")) == ""
+    assert list_label(entry("对腾讯的 Q3 财报进行综合分析", kind="inbox")) == "inbox"
+    assert list_label(entry("把小米 SU7 送 4S 店保养", list_name="Waiting")) == "Waiting"
+
 
 def test_gtd_list_name_is_not_printed():
     """GTD 条目右侧不印列表名，整块 `.list` 不渲染（不是印个空 div 占位）。"""
@@ -676,11 +685,12 @@ def test_waiting_list_name_still_printed():
     assert '<div class="list">Waiting</div>' in page
 
 
-def test_inbox_entry_has_no_list_label():
-    """收件箱条目本来就在「收件箱」区：`inbox` 那三个字也是重复的，一并留空。"""
+def test_inbox_entry_prints_inbox_label_on_the_right():
+    """收件箱条目右侧印 `inbox`（老板 2026-11-23 改回显示），底色与细线照旧并存。"""
     page, *_ = build_today_html([entry("对腾讯的 Q3 财报进行综合分析", kind="inbox")], now=NOW)
-    assert '<div class="list">' not in page
-    assert "inbox" not in visible(page).lower()
+    assert '<div class="list">inbox</div>' in page
+    assert "inbox" in _lower_block(page)
+    assert "background: #f1ede4" in page, "标签与底色并存：底色不许因为加了标签就去掉"
 
 
 def test_hidden_list_column_gives_width_back_to_title():
@@ -711,13 +721,24 @@ def test_markdown_keeps_list_column_for_waiting_and_blanks_gtd_rows():
     assert "GTD" not in text
 
 
+def test_markdown_inbox_table_carries_the_inbox_label():
+    """收件箱表出现「列表」列，每行印 `inbox`；GTD 区那几张表照旧不带这一列。"""
+    text = md([entry("卖出 ≥550 股 SCHO", number=1, at=time(22, 30)),
+               entry("对腾讯的 Q3 财报进行综合分析", number=7, kind="inbox")])
+    inbox_part = text.split("**收件箱**", 1)[1]
+    assert "| # | 标题 | 列表 |" in inbox_part
+    assert "| 7 | 对腾讯的 Q3 财报进行综合分析 | inbox |" in inbox_part
+    assert "| # | 时刻 | 标题 |" in text, "今日区全是 GTD：这一区不出现「列表」列"
+    assert "| 1 | 22:30 | 卖出 ≥550 股 SCHO |" in text
+
+
 def _lower_block(page: str) -> str:
     """只取收件箱区（`.lower`）那一段 HTML。"""
     return page.split('<div class="lower">', 1)[1].split('<div class="foot"', 1)[0]
 
 
 def test_inbox_section_is_isolated_by_light_band_and_hairline():
-    """方案 B：极浅米灰底 + 上方 1px 细线，不加任何文字标签、不做卡片。"""
+    """方案 B：极浅米灰底 + 上方 1px 细线，不做卡片；区里除了 inbox 标签不加别的文字。"""
     page, *_ = build_today_html([entry("今天的事", number=1),
                                  entry("想到一个点子", number=2, kind="inbox")], now=NOW)
     css = page.split("<style>", 1)[1].split("</style>", 1)[0]
@@ -727,8 +748,8 @@ def test_inbox_section_is_isolated_by_light_band_and_hairline():
     assert "background: #f1ede4" in band, "整区铺极浅米灰底（页面底是 #f7f5f0）"
     assert "border-top: 1px solid #cfc7bd" in band, "上方一条细线，用现有分隔色"
     assert "border-radius" not in band, "不做卡片"
-    assert re.sub(r"<[^>]+>", "", _lower_block(page)).strip() == "2想到一个点子", \
-        "隔离靠底色：收件箱区里不许出现任何新增文字标签"
+    assert re.sub(r"<[^>]+>", "", _lower_block(page).replace('<div class="list">inbox</div>', "")).strip() \
+        == "2想到一个点子", "隔离靠底色：收件箱区里除了老板要的 inbox 标签，不许再加别的文字"
 
 
 def test_inbox_band_is_not_rendered_without_inbox_entries():
