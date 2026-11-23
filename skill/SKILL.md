@@ -11,6 +11,8 @@ metadata:
 
 本地 GTD 壳 + macOS 提醒事项。**Reminder 是主数据源**（提醒、iCloud 同步、多设备通知全交给系统），本地 SQLite 只存三样可重建的东西：收件箱、图上编号、只读镜像。
 
+**分类走列表**：我自己建的列表一律英文（`GTD` / `Waiting`），老板自己建的保持中文（`提醒事项`）——英文名是我建的标记，别把两边命名混成一套。**旧的四状态 / 九分类 / SQLite 账本设计已废**（2026-11-23 转向），别照旧笔记复活它。
+
 唯一权威设计见 `~/workspace/gtd/DESIGN.md`。仓库 `github.com/yapex/omygtd`：测试绿即直接 commit + push。
 `~/.hermes/skills/gtd` 是指向仓库 `skill/` 的软链——**改 skill 就是改代码，要 commit**。
 
@@ -153,3 +155,5 @@ gtd view
 **紧急响铃 EventKit 不暴露**：Reminders.app 界面有 Urgent 开关，但 EventKit 没这个属性。要开只能手动进 app。
 
 **子任务未验证**：Reminders.app 界面支持子任务，但 EventKit 是否暴露父子关系**没查清**（调研被取消了）。目前一条主任务带多个子项时，记成独立的多条提醒。
+
+**`remindctl list` 的计数只算未完成**：要看全量条数（含已完成）用 `--json` 读 `total`，否则「库里到底多少条」会系统性少报（2026-11-23 实测）。`gtd list` 同源，报数前先想清楚问的是哪一种。
