@@ -23,11 +23,12 @@ import os
 import shutil
 import sys
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from . import (__version__, audit, doctor, parser as nlp, priority as prio,
+from . import (__version__, audit, doctor, lock, parser as nlp, priority as prio,
                repeat as rep, render)
 from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
 from .reminders import RemindctlAdapter, ReminderStore
@@ -73,8 +74,14 @@ def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
     except SystemExit as exc:          # argparse：未知命令、缺参数 → 2；--help → 0
         return int(exc.code or 0)
     try:
-        ctx = _context(args, store, now)
-        result = DISPATCH[args.command](ctx, args)
+        with _write_lock(args, raw):
+            ctx = _context(args, store, now)
+            result = DISPATCH[args.command](ctx, args)
+    except lock.LockTimeout as exc:    # 另一进程正在写：等满 10 秒也不许硬闯
+        payload = {"ok": False, "error": str(exc)}
+        _audit(args, raw, None, EXIT_FAIL, payload)
+        _write(payload, args.human, args.command)
+        return EXIT_FAIL
     except (RuntimeError, ValueError, OSError) as exc:
         _audit(args, raw, None, EXIT_FAIL, {"ok": False, "error": str(exc)},
                tb=traceback.format_exc())
@@ -83,6 +90,14 @@ def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
     _audit(args, raw, result.audit, result.code, result.payload)
     _write(result.payload, args.human, args.command)
     return result.code
+
+
+def _write_lock(args, raw):
+    """只有写命令拿锁；view / board / list / doctor 只读，不该被别的进程阻塞。"""
+    if args.command not in lock.WRITE_COMMANDS:
+        return nullcontext()
+    db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
+    return lock.write_lock(db, tag=" ".join(raw))
 
 
 def _audit(args, raw, material, code, payload, *, tb=None) -> None:

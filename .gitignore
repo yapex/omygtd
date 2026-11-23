@@ -6,6 +6,7 @@ capture*.jsonl
 *.db
 *.db-wal
 *.db-shm
+.gtd.lock
 
 # 开发环境
 .venv/
