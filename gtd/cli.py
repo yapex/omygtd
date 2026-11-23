@@ -1,8 +1,18 @@
-"""命令层：参数解析与调度，默认输出 JSON。
+"""命令层 v2：add / inbox / clarify / board / done / list。
 
-职责边界（S/D）：只解析参数、调数据层、把产物交给输出。
-- 不 import sqlite3，SQL 全在 store.py
-- 不按格式分支：渲染器一律从注册表取（L）
+老板经对话让我调 CLI（不是自己敲），所以**默认输出 JSON**（机器读），
+``--human`` 才给人看。退出码：0 成功 / 1 业务失败 / 2 参数错误。
+
+依赖注入：
+- ``store``：``ReminderStore`` 从外面传进来（测试传 ``FakeStore``），本模块不认识 remindctl
+- ``now``：``--now "2026-11-23 09:00"`` 或 ``main(now=...)`` 钉死时钟（测试用）
+- ``--db``：本地库路径（inbox / daily_seq / mirror），默认 ``data/gtd.db``，也认 ``GTD_DB``
+
+分工：
+- **有时间的任务全在 Reminder**；本地只记 inbox（没时间的念头）、当日序号、镜像。
+- Reminder 写入失败时**念头不许丢**：留在 inbox，返回 ``ok:false`` + 退出码 1。
+- 号（``daily_seq``）是老板唯一认的编号：``board`` / ``inbox`` 印它，``clarify`` /
+  ``done`` 也按它找人；还没拿到号的念头可以退回按 inbox 行 id 找。
 """
 
 from __future__ import annotations
@@ -12,264 +22,484 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import date, datetime, time
+from itertools import count
 from pathlib import Path
 
-from . import __version__
-from . import render, store as gstore
+from . import __version__, doctor, parser as nlp, render
+from .inbox import DEFAULT_DB, PROJECT_ROOT, Inbox, Mirror, Seq
+from .reminders import RemindctlAdapter, ReminderStore
 
-EXIT_OK, EXIT_PARAM, EXIT_NOT_FOUND = 0, 1, 2
-EDIT_FIELDS = ("title", "due", "slot", "category", "note", "waiting_on", "defer")
+EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
+LISTS = (nlp.LIST_DEFAULT, nlp.LIST_WAITING)
+FALLBACK_AT = nlp.DEFAULT_AT          # 只给了日期、没给时刻 → 当天 22:30 截止
+OUT_ENV = "GTD_OUT"
+STAMP_FMT = "%Y-%m-%d %H:%M"
+INBOX_LIST_LABEL = "inbox"
 
 
 @dataclass
 class Result:
     payload: dict
     code: int = EXIT_OK
-    text: str | None = None
 
 
-class _Parser(argparse.ArgumentParser):
-    """参数错统一走 ParamError（退出码 1），不让 argparse 自己 exit(2)。"""
+@dataclass
+class Context:
+    """一次命令执行的上下文：本地库两个表 + Reminder 存储 + 钉住的时刻。"""
 
-    def error(self, message):
-        raise gstore.ParamError(message)
+    inbox: Inbox
+    seq: Seq
+    store: ReminderStore
+    now: datetime
+
+    @property
+    def today(self) -> date:
+        return self.now.date()
 
 
-# ---------------------------------------------------------------- 调度
+# ---------------------------------------------------------------- 入口
 
-def main(argv=None) -> int:
+def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
+    """跑一条命令，返回退出码（0 成功 / 1 业务失败 / 2 参数错误）。"""
     try:
         args = build_parser().parse_args(argv)
-    except gstore.ParamError as exc:
-        _emit({"ok": False, "error": str(exc)})
-        return EXIT_PARAM
-    store = None
+    except SystemExit as exc:          # argparse：未知命令、缺参数 → 2；--help → 0
+        return int(exc.code or 0)
     try:
-        store = gstore.Store(getattr(args, "db", None))
-        store.init()
-        result = DISPATCH[args.command](store, args)
-    except gstore.NotFoundError as exc:
-        _emit({"ok": False, "error": str(exc)})
-        return EXIT_NOT_FOUND
-    except gstore.WriteError as exc:
-        _emit({"ok": False, "error": str(exc), "capture_id": exc.capture_id,
-               "raw_kept": True})
-        return EXIT_NOT_FOUND
-    except (gstore.ParamError, gstore.ConstraintError, ValueError) as exc:
-        _emit({"ok": False, "error": str(exc)})
-        return EXIT_PARAM
-    finally:
-        if store is not None:
-            store.close()
-    _emit(result.payload, result.text)
+        ctx = _context(args, store, now)
+        result = DISPATCH[args.command](ctx, args)
+    except (RuntimeError, ValueError, OSError) as exc:
+        _write({"ok": False, "error": str(exc)}, args.human, args.command)
+        return EXIT_FAIL
+    _write(result.payload, args.human, args.command)
     return result.code
 
 
-def _emit(payload: dict, text: str | None = None) -> None:
-    if text is not None:
-        sys.stdout.write(text if text.endswith("\n") else text + "\n")
-        return
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+def _context(args, store, now) -> Context:
+    moment = _moment(now if now is not None else args.now)
+    db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
+    return Context(Inbox(db), Seq(db),
+                   store if store is not None else RemindctlAdapter(), moment)
 
 
-# ---------------------------------------------------------------- 写命令
-
-def cmd_add(store, args) -> Result:
-    return Result(store.add(args.title, due=args.due, slot=args.slot,
-                            category=args.category, waiting_on=args.waiting_on,
-                            defer=args.defer, note=args.note, dup_ok=args.dup_ok,
-                            repeat_days=args.repeat_days))
+def _write(payload: dict, human: bool, command: str = "") -> None:
+    text = _human(command, payload) if human else json.dumps(payload, ensure_ascii=False,
+                                                             indent=2)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
 
 
-def cmd_clarify(store, args) -> Result:
-    return Result(store.clarify(args.id, args.action, due=args.due, slot=args.slot,
-                                category=args.category, note=args.note, day=args.day))
+def _moment(raw) -> datetime:
+    """``None`` / datetime / 'YYYY-MM-DD[ HH:MM[:SS]]' → datetime（本地时区口径）。"""
+    if raw is None:
+        return datetime.now()
+    if isinstance(raw, datetime):
+        return raw
+    text = str(raw).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"--now 认不出这个时刻：{raw}")
 
 
-def cmd_done(store, args) -> Result:
-    return Result(store.complete(args.ids, day=args.day))
+# ---------------------------------------------------------------- 小工具
+
+def _hhmm(moment: datetime) -> str:
+    return moment.strftime("%H:%M")
 
 
-def cmd_drop(store, args) -> Result:
-    return Result(store.drop(args.ids, day=args.day))
+def _list_of(parsed) -> str:
+    return parsed.list if parsed.list in LISTS else nlp.LIST_DEFAULT
 
 
-def cmd_edit(store, args) -> Result:
-    fields = {key: getattr(args, key) for key in EDIT_FIELDS
-              if getattr(args, key, None) is not None}
-    if args.repeat_days is not None:
-        fields["repeat_days"] = args.repeat_days
-    return Result(store.edit(args.id, day=args.day, **fields))
+def _due_at(parsed, now: datetime) -> datetime | None:
+    """解析结果 → Reminder 的到期时刻；解析不出时间给 None。"""
+    if parsed.due is None and parsed.at is None:
+        return None
+    return datetime.combine(parsed.due or now.date(), parsed.at or FALLBACK_AT)
 
 
-def cmd_undo(store, _args) -> Result:
-    return Result(store.undo())
+def _ensure_lists(store: ReminderStore) -> None:
+    """真实实现里缺列表要建（GTD / Waiting）；FakeStore 里是空操作。"""
+    store.ensure_lists()
 
 
-# ---------------------------------------------------------------- 读命令
-
-def cmd_show(store, args) -> Result:
-    row = store.require(args.id, args.day)
-    return Result({"ok": True, "seq": store.seq_of(row["id"], args.day),
-                   "task": store.public(row)})
-
-
-def cmd_board(store, args) -> Result:
-    day = args.day or gstore.today_str()
-    stream = store.entries(day)
-    renderer = render.get_renderer(args.format)
-    artifact = renderer.render(stream, args.view, _board_ctx(store, day, args))
-    payload = {"ok": True, "view": args.view, "format": args.format, "day": day,
-               "count": len(render.select_view(stream, args.view, day))}
-    if artifact.text is not None:
-        return Result(payload, text=artifact.text)
-    return Result({**payload, "path": str(artifact.path)})
+def _seq_of(ctx: Context, ref: str) -> int:
+    """同一个 ref 当天只占一个号：已分配过就复用，否则新分配。"""
+    for seq, known in ctx.seq.all(day=ctx.today).items():
+        if known == ref:
+            return seq
+    return ctx.seq.assign(ref, day=ctx.today)
 
 
-def _board_ctx(store, day: str, args) -> dict:
-    out = Path(args.out).expanduser() if args.out else _default_png(args.view, day)
-    return {"day": day, "generated_at": gstore.now_iso(), "stats": store.stats(),
-            "out": out, "db": str(store.db_path),
-            "category_order": list(gstore.CATEGORIES)}
+def _numbered(known: dict, counter, ref: str) -> int:
+    """查得到用真号；查不到临时分配一个（只在图里用，不落库）。"""
+    return known[ref] if ref in known else next(counter)
 
 
-def _default_png(view: str, day: str) -> Path:
-    root = Path(os.environ.get("GTD_OUT") or gstore.PROJECT_ROOT / "out")
-    return root / f"{view}-{day.replace('-', '')}.png"
+def _item_due(item: dict) -> datetime | None:
+    """remindctl / FakeStore 的 dueDate → datetime；认不出给 None。"""
+    text = str(item.get("dueDate") or item.get("due") or "").strip().replace("T", " ")
+    text = text.replace("Z", "")[:19]
+    for fmt in (STAMP_FMT, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
-def cmd_init(store, _args) -> Result:
-    return Result(store.init())
+def _age_days(row: dict, now: datetime) -> int:
+    try:
+        created = datetime.fromisoformat(str(row.get("created_at"))).date()
+    except ValueError:
+        return 0
+    return max(0, (now.date() - created).days)
 
 
-def cmd_sync(_store, _args) -> Result:
-    return Result({"ok": True, "implemented": False, "message": "二期未实现"})
+def _default_out(day: date) -> Path:
+    root = Path(os.environ.get(OUT_ENV) or PROJECT_ROOT / "out")
+    return root / f"today-{day.strftime('%Y%m%d')}.png"
 
 
-# ---------------------------------------------------------------- 运维命令
+# ---------------------------------------------------------------- add
 
-def cmd_doctor(store, _args) -> Result:
-    return Result(store.doctor())
-
-
-def cmd_backup(store, _args) -> Result:
-    report = store.backup()
-    if report.get("performed"):
-        report["archived"] = store.archive_old_done()
-        report["snapshot"] = _write_snapshot(store)
-    return Result(report)
-
-
-def _write_snapshot(store) -> str:
-    day = gstore.today_str()
-    path = Path(store.db_path).parent / "snapshots" / f"{day.replace('-', '')}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    artifact = render.get_renderer("md").render(store.entries(day), "all", {"day": day})
-    path.write_text(artifact.text or "", encoding="utf-8")
-    return str(path)
+def cmd_add(ctx: Context, args) -> Result:
+    """有时间进 Reminder，没时间进 inbox；Reminder 失败就留在 inbox。"""
+    parsed = nlp.parse(args.text, now=ctx.now)
+    due_at = _due_at(parsed, ctx.now)
+    if due_at is None:
+        return _park(ctx, parsed, args.note)
+    _ensure_lists(ctx.store)
+    reminder_id = ctx.store.add(parsed.title, due_at, _list_of(parsed),
+                                advance_minutes=parsed.advance_minutes,
+                                note=args.note)
+    if not reminder_id:
+        return _park(ctx, parsed, args.note, due_at=due_at,
+                     error="Reminder 写不进去，已留在收件箱")
+    return Result(_landed(ctx, parsed, reminder_id, due_at))
 
 
-DISPATCH = {
-    "add": cmd_add, "clarify": cmd_clarify, "done": cmd_done, "drop": cmd_drop,
-    "edit": cmd_edit, "show": cmd_show, "board": cmd_board, "undo": cmd_undo,
-    "doctor": cmd_doctor, "backup": cmd_backup, "init": cmd_init, "sync": cmd_sync,
-}
+def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None) -> dict:
+    return {"ok": True, "seq": _seq_of(ctx, f"reminder:{reminder_id}"),
+            "title": title or parsed.title, "list": _list_of(parsed),
+            "due": due_at.date().isoformat(), "at": _hhmm(due_at),
+            "reminder_id": reminder_id, "matched": parsed.matched,
+            "source": "reminder"}
+
+
+def _park(ctx: Context, parsed, note, error: str | None = None,
+          due_at: datetime | None = None) -> Result:
+    """念头落 inbox（不丢），迁出标记留给 clarify / done。"""
+    inbox_id = ctx.inbox.add(parsed.title, note or "", now=ctx.now)
+    payload = {"ok": error is None, "seq": _seq_of(ctx, f"inbox:{inbox_id}"),
+               "title": parsed.title, "list": None, "source": "inbox",
+               "due": due_at.date().isoformat() if due_at else None,
+               "at": _hhmm(due_at) if due_at else None,
+               "inbox_id": inbox_id, "matched": parsed.matched}
+    if error:
+        payload["error"] = error
+    return Result(payload, code=EXIT_OK if error is None else EXIT_FAIL)
+
+
+# ---------------------------------------------------------------- inbox
+
+def cmd_inbox(ctx: Context, _args) -> Result:
+    rows = ctx.inbox.pending()
+    known = {ref: seq for seq, ref in ctx.seq.all(day=ctx.today).items()}
+    items = [{"id": row["id"], "seq": known.get(f"inbox:{row['id']}"),
+              "title": row["title"], "note": row["note"],
+              "created_at": row["created_at"],
+              "age_days": _age_days(row, ctx.now)} for row in rows]
+    return Result({"ok": True, "count": len(items),
+                   "oldest_days": ctx.inbox.oldest_age_days(now=ctx.now),
+                   "items": items})
+
+
+# ---------------------------------------------------------------- clarify
+
+def cmd_clarify(ctx: Context, args) -> Result:
+    """给 inbox 里的念头补时间：Reminder 成功才打迁出标记。"""
+    row = _pending_row(ctx, args.number)
+    if row is None:
+        return Result({"ok": False,
+                       "error": f"收件箱里没有 #{args.number}（可能已定时间，或者号不存在）"},
+                      code=EXIT_FAIL)
+    parsed = nlp.parse(args.text, now=ctx.now)
+    due_at = _due_at(parsed, ctx.now)
+    if due_at is None:
+        return Result({"ok": False, "error": "没听出时间", "inbox_id": row["id"]},
+                      code=EXIT_FAIL)
+    title = parsed.title or row["title"]
+    _ensure_lists(ctx.store)
+    reminder_id = ctx.store.add(title, due_at, _list_of(parsed),
+                                advance_minutes=parsed.advance_minutes,
+                                note=row["note"])
+    if not reminder_id:
+        return Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
+                       "inbox_id": row["id"]}, code=EXIT_FAIL)
+    ctx.inbox.mark_moved(row["id"], reminder_id, now=ctx.now)
+    payload = _landed(ctx, parsed, reminder_id, due_at, title=title)
+    payload["inbox_id"] = row["id"]
+    return Result(payload)
+
+
+def _pending_row(ctx: Context, number: int) -> dict | None:
+    """按「老板看到的号」找：先看当日序号（board / inbox 上印的号），再退回 inbox 行 id。
+
+    日常路径是序号——老板在图上看到 3，就说「3 明天上午」。行 id 是兜底：
+    还没拿到号的念头（seq 为空）也能直接按 id 澄清。
+    """
+    ref = ctx.seq.lookup(number, day=ctx.today)
+    pending = ctx.inbox.pending()
+    if ref is not None:
+        if not ref.startswith(f"{INBOX_LIST_LABEL}:"):
+            return None                      # 这个号被 Reminder 里的任务占了
+        target = int(ref.partition(":")[2])
+        return next((row for row in pending if row["id"] == target), None)
+    return next((row for row in pending if row["id"] == number), None)
+
+
+# ---------------------------------------------------------------- board
+
+def cmd_board(ctx: Context, args) -> Result:
+    """今天该看的：Reminder 今天到期（含逾期）+ inbox 全部，出一张图。
+
+    出图**成功之后**顺手整表重建 mirror（``drift`` 于是变成「上次出图以后
+    Reminder 被改过」的信号）。顺序不能反：出图失败就不写镜像，否则会记下
+    一个用户根本没看到的视图。镜像写失败只进 ``warnings``，board 仍然成功。
+    """
+    known = {ref: seq for seq, ref in ctx.seq.all(day=ctx.today).items()}
+    counter = count(max(known.values(), default=0) + 1)
+    items = _open_items(ctx)                    # 出图与镜像共用这一份，不读两遍
+    tasks = _today_tasks(ctx, items, known, counter)
+    loose = _inbox_entries(ctx, known, counter)
+    entries = tasks + loose
+    out = Path(args.out).expanduser() if args.out else _default_out(ctx.today)
+    path = render.render_today(entries, now=ctx.now, out_path=out)
+    payload = {"ok": True, "path": str(path), "count": len(entries),
+               "overdue": sum(1 for entry in entries if entry.overdue_days > 0),
+               "inbox": len(loose)}
+    warnings = _mirror_after_board(ctx, items)
+    if warnings:
+        payload["warnings"] = warnings
+    return Result(payload)
+
+
+def _open_items(ctx: Context) -> list[tuple[str, dict]]:
+    """``GTD`` / ``Waiting`` 里未完成的全部条目（含明天以后）：镜像要全量。"""
+    return [(name, item) for name in LISTS for item in ctx.store.pending(name)]
+
+
+def _today_tasks(ctx: Context, items, known: dict, counter) -> list:
+    rows = []
+    for name, item in items:
+        due = _item_due(item)
+        if due is None or due.date() > ctx.today:      # 逾期也算「今天该看」
+            continue
+        rows.append(render.Entry(
+            seq=_numbered(known, counter, f"reminder:{item.get('id')}"),
+            title=str(item.get("title") or ""),
+            at=None if due.time() == time(0, 0) else due.time(),
+            list_name=name,
+            overdue_days=max(0, (ctx.today - due.date()).days)))
+    return rows
+
+
+def _mirror_after_board(ctx: Context, items) -> list[str]:
+    """按刚读到的 Reminder 状态整表重建镜像；失败只返回警告，绝不拖垮出图。"""
+    rows = [_mirror_row(name, item) for name, item in items if item.get("id")]
+    try:
+        Mirror(ctx.inbox.db_path).replace_all(rows, now=ctx.now)
+    except Exception as exc:      # noqa: BLE001 —— 镜像只是备份，board 才是主价值
+        return [f"镜像重建失败：{exc}"]
+    return []
+
+
+def _mirror_row(name: str, item: dict) -> dict:
+    """Reminder 条目 → ``Mirror.replace_all`` 认的行（列表名取循环里的，别信条目）。"""
+    return {"reminder_id": str(item.get("id") or ""),
+            "title": str(item.get("title") or ""),
+            "list_name": name,
+            "due_at": item.get("dueDate") or None,
+            "completed": int(bool(item.get("isCompleted"))),
+            "synced_at": None}       # 让 replace_all 用注入的 now 盖章
+
+
+def _inbox_entries(ctx: Context, known: dict, counter) -> list:
+    return [render.Entry(seq=_numbered(known, counter, f"inbox:{row['id']}"),
+                         title=row["title"], at=None, list_name=INBOX_LIST_LABEL,
+                         overdue_days=0, kind=INBOX_LIST_LABEL)
+            for row in ctx.inbox.pending()]
+
+
+# ---------------------------------------------------------------- done
+
+def cmd_done(ctx: Context, args) -> Result:
+    """按当日序号完成；逐条报结果，有一条不行就算业务失败。"""
+    results = [_done_one(ctx, raw) for raw in args.seqs]
+    return Result({"ok": all(item["ok"] for item in results), "results": results},
+                  code=EXIT_OK if all(item["ok"] for item in results) else EXIT_FAIL)
+
+
+def _done_one(ctx: Context, raw) -> dict:
+    try:
+        seq = int(raw)
+    except (TypeError, ValueError):
+        return {"seq": raw, "ok": False, "error": "序号不是整数"}
+    ref = ctx.seq.lookup(seq, day=ctx.today)
+    if ref is None:
+        return {"seq": seq, "ok": False, "error": "今天的号里没有这一个"}
+    kind, _, target = ref.partition(":")
+    if kind == "reminder":
+        ok = bool(ctx.store.complete(target))
+        item = {"seq": seq, "ok": ok, "ref": ref, "source": "reminder"}
+        return item if ok else {**item, "error": "Reminder 完成失败"}
+    if kind == INBOX_LIST_LABEL:          # 理论上不会出现，出现了也不能崩
+        if ctx.inbox.mark_moved(target, "", now=ctx.now):
+            return {"seq": seq, "ok": True, "ref": ref, "source": INBOX_LIST_LABEL}
+        return {"seq": seq, "ok": False, "ref": ref, "source": INBOX_LIST_LABEL,
+                "error": "这条念头已经迁出收件箱（clarify 之后会拿到新号，看图上的新号）"}
+    return {"seq": seq, "ok": False, "ref": ref, "error": f"不认识的引用 {ref}"}
+
+
+# ---------------------------------------------------------------- list
+
+def cmd_list(ctx: Context, _args) -> Result:
+    """Reminder 各列表的条数（薄封装：只认 Protocol，不在这里起子进程）。"""
+    totals: dict[str, int] = {}
+    open_counts: dict[str, int] = {}
+    for item in ctx.store.all():
+        name = str(item.get("listName") or "?")
+        totals[name] = totals.get(name, 0) + 1
+        if not item.get("isCompleted"):
+            open_counts[name] = open_counts.get(name, 0) + 1
+    lists = [{"name": name, "total": totals[name], "open": open_counts.get(name, 0)}
+             for name in sorted(totals)]
+    return Result({"ok": True, "lists": lists})
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(ctx: Context, _args) -> Result:
+    """体检：只读，修不修由人定。problems 非空 = 有病，退出码 1。"""
+    health = doctor.check(inbox_db=ctx.inbox.db_path, store=ctx.store, now=ctx.now)
+    payload = {"ok": health.ok, "inbox_lag_days": health.inbox_lag_days,
+               "inbox_count": health.inbox_count, "reminder_ok": health.reminder_ok,
+               "mirror_drift": health.mirror_drift,
+               "problems": list(health.problems)}
+    return Result(payload, code=EXIT_OK if health.ok else EXIT_FAIL)
+
+
+# ---------------------------------------------------------------- --human
+
+def _human(command: str, payload: dict) -> str:
+    if command == "doctor":
+        return _human_doctor(payload)
+    if not payload.get("ok", True):
+        return f"✗ {payload.get('error') or '失败'}"
+    if command in ("add", "clarify"):
+        return f"✓ #{payload['seq']} {payload.get('title') or ''}{_when(payload)}"
+    if command == "inbox":
+        return _human_inbox(payload)
+    if command == "board":
+        return f"✓ {payload['count']} 条 → {payload['path']}"
+    if command == "done":
+        return _human_done(payload)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _when(payload: dict) -> str:
+    if not payload.get("due"):
+        return "（收件箱，还没定时间）"
+    return f" · {payload['due']} {payload.get('at') or ''}".rstrip()
+
+
+def _human_inbox(payload: dict) -> str:
+    if not payload["items"]:
+        return "收件箱是空的"
+    lines = [f"{len(payload['items'])} 条待澄清 · 最老 {payload['oldest_days']} 天"]
+    lines += [f"{item['id']}. {item['title']}（{item['age_days']} 天）"
+              for item in payload["items"]]
+    return "\n".join(lines)
+
+
+def _human_done(payload: dict) -> str:
+    if payload.get("results"):
+        lines = [(f"✓ #{item['seq']} 完成" if item["ok"]
+                  else f"✗ #{item['seq']} {item.get('error') or '失败'}")
+                 for item in payload["results"]]
+        return "\n".join(lines)
+    return "✓ 完成"
+
+
+def _human_doctor(payload: dict) -> str:
+    if payload.get("error"):
+        return f"✗ {payload['error']}"
+    if payload.get("ok"):
+        return (f"✓ 健康（收件箱 {payload['inbox_count']} 条 · "
+                f"最老 {payload['inbox_lag_days']} 天 · 镜像差 {payload['mirror_drift']}）")
+    lines = ["✗ 有问题：", *(f"· {item}" for item in payload.get("problems", []))]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- 参数定义
 
+DISPATCH = {"add": cmd_add, "inbox": cmd_inbox, "clarify": cmd_clarify,
+            "board": cmd_board, "done": cmd_done, "list": cmd_list,
+            "doctor": cmd_doctor}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="gtd", description="单人 GTD 系统（MVP-1，本地 SQLite）")
+    parser = argparse.ArgumentParser(
+        prog="gtd", description="单人 GTD（v2）：有时间进 Reminder，没时间进收件箱")
     parser.add_argument("--version", action="version", version=f"gtd {__version__}")
     parser.add_argument("--db", metavar="PATH",
-                        help="库文件路径；优先级 --db > GTD_DB > 默认正式库")
+                        help="本地库路径；优先级 --db > GTD_DB > data/gtd.db")
+    parser.add_argument("--now", metavar="WHEN",
+                        help="钉住当前时刻（测试用），如 '2026-11-23 09:00'")
+    parser.add_argument("--human", action="store_true", help="给人看的文字输出（默认 JSON）")
     sub = parser.add_subparsers(dest="command", required=True)
-    for builder in (_add, _clarify, _done, _drop, _edit, _show, _board,
-                    _undo, _doctor, _backup, _init, _sync):
+    for builder in (_add, _inbox, _clarify, _board, _done, _list, _doctor):
         builder(sub)
     return parser
 
 
-def _add(sub):
-    p = sub.add_parser("add", help="捕获一条任务")
-    p.add_argument("title")
-    p.add_argument("--due")
-    p.add_argument("--slot")
-    p.add_argument("--category", choices=gstore.CATEGORIES)
-    p.add_argument("--waiting-on", dest="waiting_on")
-    p.add_argument("--defer")
-    p.add_argument("--note")
-    p.add_argument("--repeat-days", dest="repeat_days", metavar="N",
-                   help="周期任务：每 N 天（1..365）；必须同时给 --due")
-    p.add_argument("--dup-ok", dest="dup_ok", action="store_true")
+def _add(sub) -> None:
+    p = sub.add_parser("add", help="记一条：有时间进 Reminder，没时间进收件箱")
+    p.add_argument("text")
+    p.add_argument("--note", default="")
 
 
-def _clarify(sub):
-    p = sub.add_parser("clarify", help="收件箱 → 具体下一步")
-    p.add_argument("id")
-    p.add_argument("--action", required=True)
-    p.add_argument("--due")
-    p.add_argument("--slot")
-    p.add_argument("--category", choices=gstore.CATEGORIES)
-    p.add_argument("--note")
-    p.add_argument("--day")
+def _inbox(sub) -> None:
+    sub.add_parser("inbox", help="列出还没迁出的念头")
 
 
-def _done(sub):
-    p = sub.add_parser("done", help="完成（可多个 id）")
-    p.add_argument("ids", nargs="+")
-    p.add_argument("--day")
+def _clarify(sub) -> None:
+    p = sub.add_parser("clarify", help="给收件箱里的念头补时间")
+    p.add_argument("number", metavar="N", type=int,
+                   help="当日序号（board / inbox 上的号）；没有序号时按 inbox 行 id")
+    p.add_argument("text")
 
 
-def _drop(sub):
-    p = sub.add_parser("drop", help="放弃（可多个 id）")
-    p.add_argument("ids", nargs="+")
-    p.add_argument("--day")
+def _board(sub) -> None:
+    p = sub.add_parser("board", help="出今日视图（一张 PNG）")
+    p.add_argument("--out", metavar="PATH", help="图片路径；默认 out/today-YYYYMMDD.png")
 
 
-def _edit(sub):
-    p = sub.add_parser("edit", help="改内容字段（不能改 status）")
-    p.add_argument("id")
-    for flag in ("--title", "--due", "--slot", "--category", "--note",
-                 "--waiting-on", "--defer"):
-        p.add_argument(flag)
-    p.add_argument("--repeat-days", dest="repeat_days", metavar="N",
-                   help="每 N 天；0 或空串表示取消周期")
-    p.add_argument("--day")
+def _done(sub) -> None:
+    p = sub.add_parser("done", help="按当日序号完成（可多个）")
+    p.add_argument("seqs", nargs="+")
 
 
-def _show(sub):
-    p = sub.add_parser("show", help="显示单条")
-    p.add_argument("id")
-    p.add_argument("--day")
+def _list(sub) -> None:
+    sub.add_parser("list", help="Reminder 各列表条数")
 
 
-def _board(sub):
-    p = sub.add_parser("board", help="看板：today / inbox / categories / all")
-    p.add_argument("--view", choices=render.VIEWS, default="today")
-    p.add_argument("--format", choices=render.formats(), default="json")
-    p.add_argument("--out")
-    p.add_argument("--day")
-
-
-def _undo(sub):
-    sub.add_parser("undo", help="撤销上一次写操作")
-
-
-def _doctor(sub):
-    sub.add_parser("doctor", help="体检")
-
-
-def _backup(sub):
-    sub.add_parser("backup", help="当日有变化则备份")
-
-
-def _init(sub):
-    sub.add_parser("init", help="建库建目录")
-
-
-def _sync(sub):
-    sub.add_parser("sync", help="二期桩")
+def _doctor(sub) -> None:
+    sub.add_parser("doctor", help="体检：收件箱积压 / Reminder 可用 / 镜像漂移")
 
 
 if __name__ == "__main__":

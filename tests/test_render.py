@@ -1,314 +1,192 @@
-"""阶段 2 · 渲染层测试（先写测试，后写实现）。
+"""今日视图渲染测试（重写 4/6）。
 
-渲染层只吃「统一条目流」，不认识 SQLite —— 这里所有条目都是手写的。
+只断言生成的 HTML 内容；只有一条真截图（Chrome 启动慢，别多开）。
 """
 
 from __future__ import annotations
 
-import json
 import re
+from datetime import datetime, time
 
 import pytest
 
-from gtd.render import (
-    Artifact,
-    JsonRenderer,
-    MdRenderer,
-    PngRenderer,
-    build_html,
-    fold_line,
-    get_renderer,
-    register_renderer,
-    select_view,
-    when_label,
-)
+from gtd.render import Entry, _find_chrome, _png_size, build_today_html, render_today
 
-DAY = "2026-11-22"
-ORDER = ("购物", "投资", "家庭", "健康", "家务", "学习", "工作", "预约", "其他")
+NOW = datetime(2026, 11, 23, 21, 40)          # 周一晚上 21:40
+
+
+def entry(seq, title, *, at=None, list_name="GTD", overdue_days=0, kind="task"):
+    return Entry(seq=seq, title=title, at=at, list_name=list_name,
+                 overdue_days=overdue_days, kind=kind)
+
+
+FIVE = [
+    entry(1, "周会", at=time(9, 30), list_name="工作"),
+    entry(2, "交材料", at=time(15, 0)),
+    entry(3, "喝咖啡", at=time(18, 0), overdue_days=2),
+    entry(4, "买鸡蛋", kind="inbox"),
+    entry(5, "给车做保养", list_name="Waiting", kind="inbox"),
+]
 
 
 def visible(page: str) -> str:
-    """去掉标签，只留可见文字（折叠行逐字比对用）。"""
+    """去掉标签与 style/script，只留人眼能看到的字。"""
+    page = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", page, flags=re.S)
     return re.sub(r"<[^>]+>", "", page)
 
 
-def entry(seq, title, *, category="其他", slot="all", due=DAY, status="next",
-          tags=(), id=None):
-    return {
-        "kind": "task", "id": id if id is not None else 100 + seq, "seq": seq,
-        "title": title, "slot": slot, "category": category, "tags": list(tags),
-        "due": due, "defer": None, "status": status, "waiting_on": None, "note": None,
-        "capture_id": f"cap-{seq}", "completed_at": None,
-        "created_at": "2026-11-22T09:00:00+08:00",
-        "updated_at": "2026-11-22T09:00:00+08:00", "sync_state": "none",
-    }
+def titles_of(page: str) -> list[str]:
+    return re.findall(r'<div class="title">([^<]*)</div>', page)
 
 
-@pytest.fixture()
-def mixed_stream():
-    """1 条今天到期的 + 4 条投资（下一步、未来）+ 3 条收件箱。"""
-    return [
-        entry(1, "打款给房东", category="预约", slot="am", due=DAY),
-        entry(2, "看盘", category="投资", due="2026-11-30"),
-        entry(3, "读财报", category="投资", due="2026-11-30"),
-        entry(4, "调仓", category="投资", due="2026-11-30"),
-        entry(5, "算估值", category="投资", due="2026-11-30"),
-        entry(6, "买鸡蛋", due=None, status="inbox"),
-        entry(7, "预约体检", due=None, status="inbox"),
-        entry(8, "剪头发", due=None, status="inbox"),
-    ]
+# ---------- 1. 空列表 ----------
+
+def test_empty_list_renders_top_and_footer_only():
+    page, width, height = build_today_html([], now=NOW)
+    assert width == 1080 and height > 0
+    text = visible(page)
+    assert "今天 0 件" in text and "逾期 0 件" in text and "收件箱 0 条" in text
+    assert "只读 · 21:40" in text
+    assert 'class="row"' not in page, "空列表不该有任何行"
 
 
-# ---------- 折叠文案（逐字） ----------
+# ---------- 2 / 3. 时刻列 ----------
 
-def test_fold_line_text_exact():
-    assert fold_line("投资", 4, 2) == "投资共 4 条，这里 2 条 · 说「看投资」给全部"
-
-
-def test_fold_line_inbox_text_exact():
-    assert fold_line("收件箱", 5, 2) == "收件箱共 5 条，这里 2 条 · 说「看收件箱」给全部"
-
-
-# ---------- 视图分区 ----------
-
-def test_select_view_today_uses_due_only(mixed_stream):
-    today = select_view(mixed_stream, "today", DAY)
-    assert [e["title"] for e in today] == ["打款给房东"]
+def test_timed_entry_shows_clock():
+    page, *_ = build_today_html([entry(1, "周会", at=time(9, 30))],
+                                now=datetime(2026, 11, 23, 8, 0))
+    assert "09:30" in visible(page)
+    assert '<div class="at">09:30</div>' in page
 
 
-def test_select_view_inbox(mixed_stream):
-    assert len(select_view(mixed_stream, "inbox", DAY)) == 3
+def test_untimed_entry_leaves_clock_column_empty():
+    page, *_ = build_today_html([entry(1, "有空再说")], now=NOW)
+    assert '<div class="at"></div>' in page
+    rows = page.split('<div class="foot">')[0]
+    assert re.search(r"\d{2}:\d{2}", visible(rows)) is None, "无 at 不许凭空出现时刻"
 
 
-def test_select_view_skips_done(mixed_stream):
-    mixed_stream.append(entry(9, "已完成的", status="done", due=DAY))
-    assert all(e["status"] != "done" for e in select_view(mixed_stream, "all", DAY))
+# ---------- 4. 逾期标签 ----------
+
+def test_overdue_renders_tag_in_red_brown():
+    page, *_ = build_today_html([entry(3, "喝咖啡", overdue_days=2)], now=NOW)
+    assert "逾期 2 天" in visible(page)
+    assert '<span class="tag">逾期 2 天</span>' in page
+    assert re.search(r"\.tag \{[^}]*#b4472e", page), "逾期标签必须是红褐色 #b4472e"
+    assert '<div class="seq">3</div>' in page, "序号不许跟着变色"
 
 
-# ---------- md：不折叠 ----------
-
-def test_md_not_folded(mixed_stream):
-    art = MdRenderer().render(mixed_stream, "all", {"day": DAY})
-    rows = [line for line in art.text.splitlines()
-            if line.startswith("| ") and not line.startswith("| # ")]
-    assert len(rows) == 8, "md 必须全量，不许折叠"
-    assert "这里 2 条" not in art.text
+def test_not_overdue_has_no_tag():
+    page, *_ = build_today_html([entry(1, "正常事")], now=NOW)
+    assert "逾期" not in visible(page).replace("逾期 0 件", "")
 
 
-def test_md_has_seq_and_id_columns(mixed_stream):
-    text = MdRenderer().render(mixed_stream, "today", {"day": DAY}).text
-    assert "| # | id |" in text
-    assert "| 1 | 101 |" in text
+# ---------- 5. inbox 落下去 ----------
+
+def test_inbox_entry_goes_to_lower_section():
+    page, *_ = build_today_html(
+        [entry(1, "周会", at=time(9, 30)), entry(2, "买鸡蛋", kind="inbox")], now=NOW)
+    head, lower = page.split('class="lower"', 1)
+    assert "买鸡蛋" in lower and "周会" not in lower
+    assert "买鸡蛋" not in head, "inbox 条目不许留在上区"
 
 
-# ---------- 周期任务（repeat_days）的显示 ----------
-
-def test_md_has_repeat_column_with_label():
-    repeat = entry(1, "拼多多领券", category="购物")
-    repeat["repeat_days"] = 5
-    oneoff = entry(2, "一次性的事")
-    text = MdRenderer().render([repeat, oneoff], "all", {"day": DAY}).text
-    rows = [line for line in text.splitlines()
-            if line.startswith("| ") and not line.startswith("| # ")]
-    assert "| 周期 |" in text
-    assert rows[0].split("|")[6].strip() == "每 5 天"
-    assert rows[1].split("|")[6].strip() == ""
+def test_inbox_row_shows_no_clock():
+    page, *_ = build_today_html([entry(2, "买鸡蛋", at=time(9, 30), kind="inbox")],
+                                now=NOW)
+    assert "09:30" not in page, "inbox 条目不显示时刻"
 
 
-def test_png_repeat_tag_shows_cycle():
-    """today 图里周期任务的标签显示「每 5 天」。"""
-    item = entry(1, "拼多多领券", category="购物")
-    item["repeat_days"] = 5
-    html, _w, _h = build_html([item], "today", {"day": DAY})
-    assert "每 5 天" in visible(html)
-    assert '<span class="tag">今天 · 每 5 天</span>' in html
+# ---------- 6. 序号不重排 ----------
+
+def test_seq_uses_given_value_and_is_not_renumbered():
+    entries = [entry(3, "甲"), entry(7, "乙"), entry(11, "丙")]
+    page, *_ = build_today_html(entries, now=NOW)
+    assert re.findall(r'<div class="seq">(\d+)</div>', page) == ["3", "7", "11"]
 
 
-# ---------- json：完整字段 ----------
+# ---------- 7. 顶栏三个数字 ----------
 
-def test_json_has_all_fields(mixed_stream):
-    art = JsonRenderer().render(mixed_stream, "all", {"day": DAY})
-    payload = json.loads(art.text)
-    assert payload["count"] == 8
-    assert payload["view"] == "all"
-    first = payload["entries"][0]
-    for key in ("kind", "id", "seq", "title", "slot", "category", "tags",
-                "due", "status", "waiting_on", "note", "created_at"):
-        assert key in first
+def test_top_bar_counts_match_entries():
+    page, *_ = build_today_html(FIVE, now=NOW)
+    text = visible(page)
+    assert "今天 5 件" in text
+    assert "逾期 1 件" in text
+    assert "收件箱 2 条" in text
 
 
-# ---------- png：折叠生效 ----------
+# ---------- 8. 底部时间戳 ----------
 
-def test_today_png_folds_each_category_to_two(mixed_stream):
-    html, _w, _h = build_html(mixed_stream, "today", {"day": DAY})
-    text = visible(html)
-    assert "投资共 4 条，这里 2 条 · 说「看投资」给全部" in text
-    assert "收件箱共 3 条，这里 2 条 · 说「看收件箱」给全部" in text
-    assert html.count("看盘") == 1 and html.count("读财报") == 1
-    assert "调仓" not in html and "算估值" not in html
+def test_footer_stamp_is_read_only_and_clock():
+    page, *_ = build_today_html(FIVE, now=NOW)
+    assert re.search(r'<div class="foot">只读 · \d{2}:\d{2}</div>', page)
+    assert "只读 · 21:40" in visible(page)
 
 
-def test_png_no_fold_when_within_limit():
-    stream = [entry(1, "甲", category="投资"), entry(2, "乙", category="投资")]
-    html, _w, _h = build_html(stream, "today", {"day": DAY})
-    assert "共 2 条" not in visible(html)
+# ---------- 9. 不出现拟 UI 字样 ----------
+
+def test_page_has_no_ui_furniture_words():
+    page, *_ = build_today_html(FIVE, now=NOW)
+    text = visible(page)
+    for word in ("点击", "按钮", ">", "→", "▸", "查看"):
+        assert word not in text, word
 
 
-def test_today_section_never_folds(mixed_stream):
-    """今日区不折叠：4 条到期条目必须全部出现，且不产生无分类名的折叠行。"""
-    stream = [entry(i, f"今日事{i}") for i in range(1, 5)]
-    html, _w, _h = build_html(stream, "today", {"day": DAY})
-    text = visible(html)
-    assert "这里 2 条" not in text
-    for i in range(1, 5):
-        assert f"今日事{i}" in text
+def test_page_has_no_table_or_card_decoration():
+    page, *_ = build_today_html(FIVE, now=NOW)
+    assert "<table" not in page and "<button" not in page
+    assert "border:" not in page and "border-top" not in page, "不许有表格线/卡片边框"
 
 
-def test_inbox_png_lists_everything_numbered(mixed_stream):
-    """收件箱视图折叠等于自毁功能：必须全量、带 1..N 编号、顶部没有三格。"""
-    html, _w, _h = build_html(mixed_stream, "inbox", {"day": DAY})
-    text = visible(html)
-    assert 'class="stats"' not in html, "收件箱视图不要今天的三格"
-    assert "收件箱共 3 条，这里 2 条" not in text, "收件箱视图不许折叠"
-    for title in ("买鸡蛋", "预约体检", "剪头发"):
-        assert title in html, title
-    numbers = re.findall(r'<div class="seq">(\d+)</div>', html)
-    assert numbers == ["1", "2", "3"], numbers
+# ---------- 排序、红褐色时刻、转义 ----------
+
+def test_timed_sorted_ascending_untimed_last():
+    entries = [entry(1, "无时的"), entry(2, "晚的", at=time(18, 0)),
+               entry(3, "早的", at=time(9, 30))]
+    page, *_ = build_today_html(entries, now=NOW)
+    assert titles_of(page) == ["早的", "晚的", "无时的"]
 
 
-def test_inbox_png_intro_is_one_line_and_counts_oldest():
-    stream = [entry(1, "新记的", status="inbox", due=None),
-              entry(2, "放久的", status="inbox", due=None)]
-    stream[1]["created_at"] = "2026-11-17T09:00:00+08:00"      # 落后 5 天
-    html, _w, _h = build_html(stream, "inbox", {"day": DAY})
-    text = visible(html)
-    assert "2 条待澄清 · 最老 5 天" in text
-    assert "说「1 归到购物」「2、3 删掉」就能处理。" in text
-    assert ">逾期<" not in text and "今日完成" not in text
+def test_past_clock_turns_red_brown():
+    page, *_ = build_today_html([entry(1, "上午的事", at=time(9, 30))],
+                                now=datetime(2026, 11, 23, 15, 0))
+    assert '<div class="at past">09:30</div>' in page
+    assert re.search(r"\.at\.past \{[^}]*#b4472e", page)
 
 
-def test_inbox_age_tag_always_shown_and_red_after_three_days():
-    stream = [entry(1, "新记的", status="inbox", due=None),
-              entry(2, "放三天的", status="inbox", due=None),
-              entry(3, "放四天的", status="inbox", due=None)]
-    stream[1]["created_at"] = "2026-11-19T09:00:00+08:00"      # 3 天，还不红
-    stream[2]["created_at"] = "2026-11-18T09:00:00+08:00"      # 4 天，超过 3 天要红
-    html, _w, _h = build_html(stream, "inbox", {"day": DAY})
-    assert '<span class="tag">0 天</span>' in html
-    assert '<span class="tag">3 天</span>' in html
-    assert '<span class="tag late">4 天</span>' in html
+def test_future_clock_stays_grey():
+    page, *_ = build_today_html([entry(1, "晚点的事", at=time(20, 0))],
+                                now=datetime(2026, 11, 23, 9, 0))
+    assert '<div class="at">20:00</div>' in page and "at past" not in page
 
 
-def test_categories_png_is_batch_triage_view(mixed_stream):
-    html, _w, _h = build_html(mixed_stream, "categories",
-                              {"day": DAY, "category_order": ORDER})
-    text = visible(html)
-    assert "GTD 分类管理" in text
-    assert "条还没归类" in text
-    assert "说「1、5、7 归到购物」就能批量归。归错了说「3 改到家庭」。" in text
-    assert 'class="stats"' not in html, "三格是 today 视图的东西，分类管理不要"
-    assert "这里 2 条" not in text, "给批量操作用的视图不许折叠"
+def test_title_is_html_escaped():
+    page, *_ = build_today_html([entry(1, '<b>看</b>盘')], now=NOW)
+    assert "&lt;b&gt;看&lt;/b&gt;盘" in page and "<b>看</b>" not in page
 
 
-def test_categories_header_shows_date_and_time(mixed_stream):
-    """定稿表头：GTD 分类管理 + 11月22日 周日 · 18:50（时间不能丢）。"""
-    html, _w, _h = build_html(mixed_stream, "categories",
-                             {"day": DAY, "category_order": ORDER,
-                              "generated_at": "2026-11-22T18:50:00+08:00"})
-    assert "GTD 分类管理" in visible(html)
-    assert "11月22日 周日 · 18:50" in visible(html)
+def test_list_name_sits_in_right_column():
+    page, *_ = build_today_html([entry(1, "给车做保养", list_name="Waiting")], now=NOW)
+    assert '<div class="list">Waiting</div>' in page
 
 
-def test_categories_numbering_is_continuous(mixed_stream):
-    html, _w, _h = build_html(mixed_stream, "categories",
-                              {"day": DAY, "category_order": ORDER})
-    numbers = re.findall(r'<div class="seq">(\d+)</div>', html)
-    assert numbers == [str(i) for i in range(1, 9)], numbers
-    text = visible(html)
-    assert text.index("其他") < text.index("预约") < text.index("投资")
+def test_estimate_grows_with_rows():
+    _p1, _w1, small = build_today_html([], now=NOW)
+    _p2, _w2, big = build_today_html(FIVE, now=NOW)
+    assert big > small
 
 
-def test_categories_other_is_boxed_first_and_red(mixed_stream):
-    html, _w, _h = build_html(mixed_stream, "categories",
-                              {"day": DAY, "category_order": ORDER})
-    assert 'class="boxed"' in html
-    assert '<span class="count bad">3</span>' in html, "其他 的数量要红色"
-    assert html.index('class="boxed"') < html.index(">预约"), "其他 必须排最前"
+# ---------- 10. 真的出一张 PNG（唯一的截图用例） ----------
 
-
-def test_categories_without_other_items_has_no_box():
-    stream = [entry(1, "买鸡蛋", category="购物")]
-    html, _w, _h = build_html(stream, "categories", {"day": DAY, "category_order": ORDER})
-    assert 'class="boxed"' not in html
-    assert "全部已归类" in visible(html)
-
-
-def test_categories_header_and_footer_time():
-    """分类管理不显示时间在表头，但页脚必须有生成时刻，且表头不许留孤零零的分隔点。"""
-    ctx = {"day": DAY, "generated_at": "2026-11-22T18:50:00+08:00", "category_order": ORDER}
-    html, _w, _h = build_html([], "categories", ctx)
-    assert "周日 · </div>" not in html
-    assert "生成时刻 18:50" in html
-
-
-# ---------- 定稿版式 ----------
-
-def test_png_uses_final_layout(mixed_stream):
-    html, width, _h = build_html(mixed_stream, "today", {"day": DAY})
-    assert width == 1080
-    assert "#f7f5f0" in html, "米白底"
-    assert "GTD 每日看板" in html
-    assert "今日 · 含逾期" not in html, "定稿没有这个大标题"
-    assert "color: #c3b9ae" in html, "序号灰色"
-
-
-def test_png_stats_order_is_overdue_done_inbox(mixed_stream):
-    html, _w, _h = build_html(mixed_stream, "today", {"day": DAY})
-    assert html.index(">逾期</span>") < html.index(">今日完成</span>") < html.index("收件箱 · 最老")
-
-
-def test_png_stats_numbers_match_stream(mixed_stream):
-    mixed_stream[1]["due"] = "2026-11-01"          # 投资一
-    mixed_stream[5]["status"] = "inbox"            # 已经 inbox
-    html, _w, _h = build_html(mixed_stream, "today", {"day": DAY})
-    assert '<div class="stat bad"><b>1</b><span>逾期</span>' in html
-    assert '<div class="stat"><b>0</b><span>今日完成</span>' in html
-    assert "<b>3</b><span>收件箱 · 最老" in html
-
-
-def test_defer_only_entry_shows_start_date():
-    item = entry(9, "学 Rust", due=None)
-    item["defer"] = "2026-12-15"
-    assert when_label(item, DAY) == "12/15 起"
-
-
-def test_png_renderer_writes_file(tmp_path, mixed_stream):
+@pytest.mark.skipif(_find_chrome() is None, reason="本机没有 Chrome")
+def test_render_today_writes_png(tmp_path):
     out = tmp_path / "today.png"
-    art = PngRenderer().render(mixed_stream, "today", {"day": DAY, "out": out})
-    assert art.path == out and out.exists() and out.stat().st_size > 5000
+    path = render_today(FIVE, now=NOW, out_path=out)
+
+    assert path == out and out.exists()
     assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-
-
-# ---------- 策略注册表（开闭原则） ----------
-
-def test_registry_has_three_formats():
-    assert isinstance(get_renderer("json"), JsonRenderer)
-    assert isinstance(get_renderer("md"), MdRenderer)
-    assert isinstance(get_renderer("png"), PngRenderer)
-
-
-def test_new_format_needs_only_a_new_class():
-    class CsvRenderer:
-        def render(self, stream, view, ctx):
-            return Artifact(text="a,b\n", mime="text/csv")
-
-    register_renderer("csv", CsvRenderer)
-    art = get_renderer("csv").render([], "today", {"day": DAY})
-    assert art.text == "a,b\n"
-    assert isinstance(get_renderer("md"), MdRenderer)
-
-
-def test_renderer_artifacts_are_uniform(mixed_stream):
-    for fmt in ("json", "md"):
-        art = get_renderer(fmt).render(mixed_stream, "today", {"day": DAY})
-        assert isinstance(art, Artifact) and art.text and art.path is None
+    assert out.stat().st_size > 10 * 1024, out.stat().st_size
+    width, height = _png_size(out)
+    assert width == 2160, "宽 1080 @2x"
+    assert height > 400
+    assert list(tmp_path.glob("*.html")) == [], "临时 HTML 必须删掉"

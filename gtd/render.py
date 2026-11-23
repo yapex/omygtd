@@ -1,8 +1,12 @@
-"""渲染层：把「统一条目流」渲染成 json / md / png。
+"""渲染层：今日视图（一张图）+ 遗留的 json / md / png 注册表。
 
 职责边界（S/I）：只认条目结构，不查库、不 import sqlite3、不认识命令参数。
-三种格式是三个策略类，共用 `render(stream, view, ctx) -> Artifact` 一个方法；
-新增格式只需 register_renderer()，不改任何现有类（O），命令层只查注册表（L）。
+
+v2 的今日视图在文件末尾「v2 今日视图（一张图）」一节：输入是 ``Entry`` 条目流，
+输出一张 PNG（``render_today``）。不查库、不调 remindctl，纯输入输出。
+
+文件前半部分是 v1 遗留的策略注册表（``get_renderer('json'|'md'|'png')``）——
+``cli.py`` 还在用，5/6 卡接线才删；删之前两套并存，互不调用。
 """
 
 from __future__ import annotations
@@ -11,11 +15,13 @@ import html
 import json
 import math
 import os
+import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Protocol
 
@@ -663,3 +669,216 @@ def _screenshot(page: str, out: Path, width: int, height: int) -> None:
 register_renderer("json", JsonRenderer)
 register_renderer("md", MdRenderer)
 register_renderer("png", PngRenderer)
+
+
+# ================================================================ v2 今日视图（一张图）
+#
+# 老板定稿：只有这一张图，不再有收件箱视图 / 分类视图（对话里问一句就有）。
+# 输入是 Entry 条目流（序号由 inbox.Seq 分配），输出一张 PNG。本节不查库、
+# 不调 remindctl、不看系统时钟——now 由调用方注入，纯输入输出。
+
+T_WIDTH = 1080
+T_SCALE = 2                      # --force-device-scale-factor=2，出 @2x
+T_PAD_X, T_PAD_TOP, T_PAD_BOTTOM = 64, 56, 40
+T_TOP_H = 46
+T_LINE_H = 44
+T_ROW_PAD = 20
+T_FOOT_H = 84
+T_GAP = 34
+T_SAFETY = 16
+T_SEQ_W, T_AT_W, T_LIST_W = 54, 92, 150
+T_TAG_W = 130
+T_TITLE_W = T_WIDTH - T_PAD_X * 2 - T_SEQ_W - T_AT_W - T_LIST_W - T_TAG_W
+
+
+@dataclass(frozen=True)
+class Entry:
+    """今日视图的一行。seq 由 inbox.Seq 分配，渲染层只显示、不重排。"""
+
+    seq: int
+    title: str
+    at: time | None
+    list_name: str
+    overdue_days: int                 # 0 = 不逾期
+    kind: str = "task"                # task | inbox
+
+
+def _split_today(entries: list[Entry]):
+    """上区：有 at 的按时刻升序在前、无 at 的按传入顺序垫后；下区：inbox。"""
+    tasks = [e for e in entries if e.kind != "inbox"]
+    timed = [e for e in tasks if e.at is not None]
+    timed.sort(key=lambda e: e.at or time(0, 0))
+    untimed = [e for e in tasks if e.at is None]
+    return timed + untimed, [e for e in entries if e.kind == "inbox"]
+
+
+def _top_bar_html(entries: list[Entry]) -> str:
+    """顶栏三格：今天总件数 / 逾期件数 / 收件箱条数。"""
+    sep = '<span class="sep">·</span>'
+    total, inbox = len(entries), sum(1 for e in entries if e.kind == "inbox")
+    overdue = sum(1 for e in entries if e.overdue_days > 0)
+    return (f'<div class="top">今天 <b>{total}</b> 件{sep}'
+            f'逾期 <b>{overdue}</b> 件{sep}收件箱 <b>{inbox}</b> 条</div>')
+
+
+def _at_html(entry: Entry, now: datetime) -> str:
+    """时刻列：inbox / 无 at 留空；at 早于 now（未完成）显示红褐色 #b4472e。"""
+    if entry.kind == "inbox" or entry.at is None:
+        return '<div class="at"></div>'
+    text = entry.at.strftime("%H:%M")
+    return (f'<div class="at past">{text}</div>' if entry.at < now.time()
+            else f'<div class="at">{text}</div>')
+
+
+def _tag_html(entry: Entry) -> str:
+    """逾期只做标签，不给整行上色、不给序号上色。"""
+    if entry.overdue_days <= 0:
+        return ""
+    return f'<span class="tag">逾期 {entry.overdue_days} 天</span>'
+
+
+def _entry_row(entry: Entry, now: datetime) -> str:
+    return ('<div class="row">'
+            f'<div class="seq">{entry.seq}</div>'
+            f'{_at_html(entry, now)}'
+            f'<div class="title">{html.escape(entry.title)}</div>'
+            f'{_tag_html(entry)}'
+            f'<div class="list">{html.escape(entry.list_name)}</div>'
+            '</div>')
+
+
+def _rows_block(css_class: str, entries: list[Entry], now: datetime) -> str:
+    if not entries:
+        return ""
+    rows = "".join(_entry_row(entry, now) for entry in entries)
+    return f'<div class="{css_class}">{rows}</div>'
+
+
+def _title_lines(entry: Entry) -> int:
+    px = sum(31 if ord(ch) > 127 else 16 for ch in entry.title)
+    return max(1, math.ceil(px / T_TITLE_W))
+
+
+def _today_estimate(upper: list[Entry], lower: list[Entry]) -> int:
+    """按行数估高；真实高度由 Chrome 量（见 _measure_height），这里只是兜底。"""
+    height = T_PAD_TOP + T_TOP_H + T_FOOT_H + T_PAD_BOTTOM + T_SAFETY
+    if upper:
+        height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in upper)
+    if lower:
+        height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in lower)
+    return height
+
+
+def _today_document(body: str) -> str:
+    return ('<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><style>\n'
+            + TODAY_CSS + '\n</style></head>\n<body>\n' + body
+            + '\n<div id="probe" style="display:none">0</div>'
+            '\n<script>document.getElementById("probe").textContent=String('
+            'Math.ceil(document.body.getBoundingClientRect().height));</script>'
+            '\n</body></html>\n')
+
+
+def build_today_html(entries: list[Entry], *, now: datetime) -> tuple[str, int, int]:
+    """返回 (html, 宽, 高)；高是估算值，render_today 会再用 Chrome 量一次。"""
+    upper, lower = _split_today(entries)
+    body = (_top_bar_html(entries)
+            + _rows_block("rows", upper, now)
+            + _rows_block("lower", lower, now)
+            + f'<div class="foot">只读 · {now.strftime("%H:%M")}</div>')
+    return _today_document(body), T_WIDTH, _today_estimate(upper, lower)
+
+
+def render_today(entries: list[Entry], *, now: datetime, out_path: Path) -> Path:
+    """出一张今日视图 PNG，返回文件路径。临时 HTML 写在 out 同目录、截图后删掉。"""
+    page, width, height = build_today_html(entries, now=now)
+    out = Path(out_path).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    html_path = _write_temp_html(page, out.parent)
+    try:
+        _shoot_today(html_path, out, width, height)
+    finally:
+        html_path.unlink(missing_ok=True)
+    return out
+
+
+def _write_temp_html(page: str, folder: Path) -> Path:
+    handle, name = tempfile.mkstemp(prefix=".gtd-today-", suffix=".html", dir=folder)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(page)
+    return Path(name)
+
+
+def _shoot_today(html_path: Path, out: Path, width: int, height: int) -> None:
+    """先量真实内容高度再截；截完核对 PNG 高度，裁了就加高重截一次。"""
+    chrome = _find_chrome()
+    if not chrome:
+        raise RuntimeError("找不到 Chrome，无法渲染 PNG（可用 GTD_CHROME 指定路径）")
+    need = _measure_height(chrome, html_path, width) or height
+    for target in (need, need + 240):
+        _chrome_screenshot(chrome, html_path, out, width, target)
+        if _png_size(out)[1] >= need * T_SCALE:
+            return
+    raise RuntimeError(f"截图高度不足（需要 {need * T_SCALE}px）：{_png_size(out)}")
+
+
+def _chrome_args(chrome: str, profile: str, width: int, height: int) -> list[str]:
+    return [chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+            "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+            "--disable-background-networking", f"--user-data-dir={profile}",
+            f"--window-size={width},{height}"]
+
+
+def _measure_height(chrome: str, html_path: Path, width: int) -> int | None:
+    """用 --dump-dom 让页面自己报 scrollHeight；拿不到返回 None（退回估算）。"""
+    with tempfile.TemporaryDirectory(prefix="gtd-measure-") as profile:
+        cmd = _chrome_args(chrome, profile, width, 900) + [
+            "--virtual-time-budget=2000", "--dump-dom", html_path.as_uri()]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.SubprocessError:
+            return None
+    found = re.search(r'id="probe"[^>]*>(\d+)<', proc.stdout)
+    return int(found.group(1)) if found else None
+
+
+def _chrome_screenshot(chrome: str, html_path: Path, out: Path,
+                       width: int, height: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="gtd-shot-") as profile:
+        cmd = _chrome_args(chrome, profile, width, height) + [
+            f"--force-device-scale-factor={T_SCALE}", f"--screenshot={out}",
+            html_path.as_uri()]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError(f"Chrome 截图失败 exit={proc.returncode}\n{proc.stderr[-1200:]}")
+
+
+def _png_size(path: Path) -> tuple[int, int]:
+    """直接读 PNG 的 IHDR：不引第三方库也能知道截图多高。"""
+    with open(path, "rb") as handle:
+        head = handle.read(24)
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError(f"不是 PNG 文件：{path}")
+    return struct.unpack(">II", head[16:24])
+
+
+TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #f7f5f0; }
+  body { width: 1080px; padding: 56px 64px 40px;
+         font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         color: #1b1815; -webkit-font-smoothing: antialiased; }
+  .top { font-size: 24px; color: #8a8078; letter-spacing: .02em; }
+  .top b { font-weight: 600; color: #6b6259; font-variant-numeric: tabular-nums; }
+  .top .sep { margin: 0 16px; color: #cfc7bd; }
+  .rows { margin-top: 34px; }
+  .lower { margin-top: 34px; }
+  .row { display: flex; align-items: baseline; padding: 10px 0; }
+  .seq { width: 54px; flex: none; font-size: 24px; color: #c3b9ae;
+         font-variant-numeric: tabular-nums; }
+  .at { width: 92px; flex: none; font-size: 26px; color: #6b6259;
+        font-variant-numeric: tabular-nums; }
+  .at.past { color: #b4472e; }
+  .title { flex: 1; font-size: 31px; line-height: 1.4; }
+  .tag { flex: none; margin-left: 14px; font-size: 20px; color: #b4472e;
+         background: #f4ded6; border-radius: 6px; padding: 3px 10px; }
+  .list { width: 150px; flex: none; text-align: right; font-size: 21px; color: #a89e94; }
+  .foot { margin-top: 52px; font-size: 20px; color: #b3a99f; }"""

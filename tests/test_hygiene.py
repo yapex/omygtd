@@ -56,9 +56,11 @@ def test_cli_has_no_sqlite():
     assert "sqlite3" not in _imported_modules(PKG / "cli.py")
 
 
-def test_store_is_the_only_sqlite_module():
+def test_sqlite_only_in_storage_modules():
+    """只有本地存储层能 import sqlite3；白名单是显式枚举，新模块加进来会被拦下。"""
+    storage = {"inbox.py"}
     others = [p.name for p in PKG.glob("*.py")
-              if p.name != "store.py" and "sqlite3" in _imported_modules(p)]
+              if p.name not in storage and "sqlite3" in _imported_modules(p)]
     assert others == []
 
 
@@ -67,9 +69,10 @@ def test_render_does_not_import_store_or_sqlite():
     assert not ({"store", "sqlite3"} & mods), mods
 
 
-def test_store_has_no_print_and_no_argparse():
-    assert _calls(PKG / "store.py", "print") == []
-    assert "argparse" not in _imported_modules(PKG / "store.py")
+def test_storage_has_no_print_and_no_argparse():
+    """唯一剩下的存储层（inbox.py）同样不许 print / 解析参数。"""
+    assert _calls(PKG / "inbox.py", "print") == []
+    assert "argparse" not in _imported_modules(PKG / "inbox.py")
 
 
 # ---------- 反例：按格式分支 ----------

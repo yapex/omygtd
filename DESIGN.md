@@ -57,6 +57,8 @@ gtd/
 | **external_kind** | TEXT | 【二期预留】calendar / reminder |
 | **sync_state** | TEXT | 【二期预留】none / pending / synced / failed，默认 none |
 | **last_synced_at** | TEXT | 【二期预留】 |
+| reminder_id | TEXT | 已同步到提醒事项的 EventKit id（UUID 字符串）；NULL = 未同步 |
+| reminder_synced_at | TEXT | 同步成功的时刻（ISO，本地时区） |
 
 二期四个预留字段一期建表时就存在，一期代码不读不写。
 
@@ -377,3 +379,108 @@ GTD 已上线，`data/gtd.db` 里是真实数据。开发/测试与正式数据*
 
 - `doctor` 新增两条检查：`repeat_without_due`（周期任务缺 due）、`bad_repeat_days`（超出 1..365）。
 - 周期任务完成也计入顶部「今日完成」统计（`completed_at` 是今天），但**不会**出现在「✓ N 号已完成」那一行 —— 那行只列 `status='done'` 的条目（周期任务仍停在 `next`）。
+
+## 十七、到点提醒
+
+### 17.1 一句话
+
+`gtd notify` 每 5 分钟被 launchd 叫一次：把该提醒的 `next` 任务按提醒时刻合成一条消息，用 `hermes send` 推到微信；**发成功了才写 `notified_at`**，所以同一条只提醒一次。
+
+### 17.2 时刻表（slot → 提醒时刻）
+
+| slot | 提醒时刻 | 消息标题行 |
+|---|---|---|
+| `am` | 12:00 | `⏰ 12:00 · 上午结束` |
+| `pm` | 18:00 | `⏰ 18:00 · 下午结束` |
+| `all` | 22:30 | `⏰ 22:30 · 今天最后一下` |
+| `at:HH:MM` / `before:HH:MM` | 当天 HH:MM | `⏰ HH:MM`（无后缀） |
+
+- 没有 `due`、或 slot 解析不出来 → 不产生提醒。
+- 只在 `due == 今天` 且 `status='next'` 时提醒；迟到补发窗口 `NOTIFY_GRACE = 2 小时`，超过就不补（半夜不会把白天欠的消息一次轰出来）。
+
+### 17.3 去重
+
+- 一次发送 = 一个提醒时刻下的一组任务；发成功后 `store.mark_notified(ids, at=now)` 写 `tasks.notified_at`。
+- 下一轮 `pending_notifications()` 只捞 `notified_at is null` 的，所以「等 5 分钟不重复发」靠的是这个字段，不是日志。
+- 改期会作废旧提醒：`edit` 改 due/slot 时 `notified_at` 复位成 null，重新等下一轮。
+- 发送失败**不标记**，下一轮自动重试，同时 `notify.log` 记 `FAIL`。
+
+### 17.4 消息长什么样
+
+```
+⏰ 12:00 · 上午结束
+
+还没完成 2 件：
+1. 交物业费（家务）
+2. 给车做保养
+```
+
+- 序号是当日序号（`daily_seq.seq`），跟看板一致；分类为「其他」时不显示括号。
+- 超过 5 条只列前 5 条 + `…还有 N 件`。
+- 没有到点任务就静默：`{"ok": true, "sent": 0}`，不发消息、不写日志。
+
+### 17.5 投递
+
+`hermes send --profile default --to weixin --json <消息>`。`--profile default` 不能省：heli profile 的 home 里没有 `channel_directory.json`，会报「没有平台」。目标可用环境变量 `GTD_NOTIFY_TARGET` 覆盖（如 `feishu:...`）。
+
+### 17.6 launchd
+
+- plist：`~/Library/LaunchAgents/com.yapex.gtd.notify.plist`
+- `StartInterval` 300 秒；`RunAtLoad` false —— 加载后 5 分钟才第一次跑，避免一装就骚扰。
+- 输出：`data/notify.out` / `data/notify.err`。
+- `EnvironmentVariables.PATH` 必须含 `/Users/yapex/.local/bin`（`gtd`、`hermes`）与 `/opt/homebrew/bin`（`uv`，`bin/gtd` 靠它）；launchd 默认 PATH 里两个都没有，缺了就是 `uv: not found`。
+
+安装 / 重装：
+
+```bash
+plutil -lint ~/Library/LaunchAgents/com.yapex.gtd.notify.plist
+launchctl bootout gui/$(id -u)/com.yapex.gtd.notify 2>/dev/null   # 已加载时先卸
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yapex.gtd.notify.plist
+launchctl print gui/$(id -u)/com.yapex.gtd.notify | head -20
+```
+
+### 17.7 日志
+
+`data/notify.log`（追加写，不是数据库表；`data/` 已进 `.gitignore`），管道分隔：
+
+```
+2026-11-23T12:00:05+08:00 | 12:00 | ids=12,15 | ok | message_id=hermes-weixin-xxxx
+2026-11-23T18:00:03+08:00 | 18:00 | ids=18 | FAIL | exit=1 | No profile
+```
+
+失败行最后一段是 `stderr` 首行（截断 200 字符）；hermes 把错误塞在 stdout 的 JSON 里时取它的 `error` 字段。
+
+### 17.8 体检
+
+`gtd doctor` 多一项 `notify_24h`：读 `data/notify.log` 统计最近 24 小时的 `{"ok", "fail", "last_run"}`，`last_run` 是最后一次**成功**发送的时刻。
+
+### 17.9 手工验法
+
+```bash
+gtd notify --dry-run        # 只打印将要发什么：不发送、不标记、不写日志
+gtd notify                  # 真发；没有到点任务则 {"ok": true, "sent": 0}
+gtd --db <临时库> notify --dry-run --now 2026-11-22T12:05   # --now 仅测试用，钉死时刻
+```
+
+## 十八、提醒事项单向同步
+
+### 18.1 一句话
+
+`next` + 有 `due` 的任务在入库时**尽力**复制一份到「提醒事项」的 `GTD` 列表（`gtd/reminder_bridge.py` 调 `remindctl`），`reminder_id` 非空 = 已交付；同步失败只写 `data/reminder.log`，**绝不**让写库失败。
+
+### 18.2 四个同步点
+
+| 动作 | 条件 | 做什么 |
+|---|---|---|
+| `add` | 落成 `next` 且 `due` 非空 | 建 Reminder，回写 `reminder_id` / `reminder_synced_at` |
+| `clarify`（inbox → next） | 同上 | 同上 |
+| `done` | `reminder_id` 非空 | 完成该 Reminder；周期任务滚期后再按新 `due` 建一条 |
+| `drop` | `reminder_id` 非空 | 删除该 Reminder |
+
+- **幂等**：`reminder_id` 非空时绝不再建第二条。
+- **去重**：`pending_notifications()` 排除 `reminder_id` 非空的记录 —— 交给提醒事项的，`gtd notify` 不再发，否则双重提醒。
+- Reminder 的时刻 = `notify_at(due, slot)` 的**本地时刻**（分钟级），`--due` 与 `--alarm` 都设成它。
+- 专用列表名 `REMINDER_LIST = "GTD"`，不污染用户已有列表；`ensure_list()` 负责不存在时创建。
+- 硬超时 `REMINDCTL_TIMEOUT = 20` 秒；pytest 环境下 bridge 一律不真调（`PYTEST_CURRENT_TEST` 守卫），要放行须显式 `GTD_REMINDER_ALLOW_TESTS=1`。
+- 日志：`data/reminder.log`（`GTD_REMINDER_LOG` 可覆盖），`时刻 | level | message`。
+
