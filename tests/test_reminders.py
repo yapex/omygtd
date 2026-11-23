@@ -16,7 +16,7 @@ import pytest
 
 from gtd.reminders import (FORBIDDEN_IN_TESTS, TEST_LIST, FakeStore,
                            ReminderStore, RemindctlAdapter, _guard_list,
-                           _resolve_exe, schedule)
+                           _local_stamp, _resolve_exe, schedule)
 
 REMINDCTL = _resolve_exe("remindctl") or "remindctl"
 OTHER_LIST = "GTD_TEST_B"          # 也不碰真实列表，只是第二个测试列表
@@ -179,3 +179,95 @@ def test_adapter_failures_never_raise(monkeypatch):
     assert adapter.delete("abc") is False
     assert adapter.pending(TEST_LIST) == []
     assert adapter.all() == []
+
+
+# ---------- 17-23：UTC → 本地（图上一度差 8 小时的回归） ----------
+#
+# 真实样本：老板 2026-11-23 记的那条，remindctl 给 14:30Z，Reminders.app 显示 22:30。
+# 断言写死 22:30 / 04:00 是以本机时区 Asia/Shanghai（UTC+8）为前提。
+
+REAL_UTC = "2026-11-23T14:30:00Z"
+REAL_NON_ALL_DAY = {"dueDate": REAL_UTC, "dueDateIsAllDay": False}
+
+
+def test_local_stamp_real_sample_is_2230():
+    """验收样本：14:30Z → 本地 22:30（不是 14:30）。"""
+    stamped = _local_stamp(REAL_NON_ALL_DAY["dueDate"])
+    assert stamped == "2026-11-23 22:30"
+    parsed = datetime.strptime(stamped, "%Y-%m-%d %H:%M")
+    assert (parsed.hour, parsed.minute) == (22, 30)
+
+
+def test_local_stamp_cross_day():
+    """UTC 20:00 落本地次日 04:00：跨日必须跟着日期一起走。"""
+    assert _local_stamp("2026-11-23T20:00:00Z") == "2026-11-24 04:00"
+
+
+def test_local_stamp_all_day_keeps_date_drops_time():
+    """全天条目：只有日期没有时刻（EventKit 存的是「本地零点的 UTC」16:00Z）。"""
+    stamped = _local_stamp("2026-11-24T16:00:00Z", all_day=True)
+    assert stamped == "2026-11-25"
+    assert ":" not in stamped
+
+
+def test_local_stamp_naive_input_not_converted_twice():
+    """已带本地墙钟的串（FakeStore 的格式）原样返回 —— 不许再换一次。"""
+    assert _local_stamp("2026-11-24 10:00") == "2026-11-24 10:00"
+
+
+def test_local_stamp_junk_passes_through():
+    """认不出的串不抛、不猜；空值给空串。"""
+    assert _local_stamp("明天早上") == "明天早上"
+    assert _local_stamp("") == ""
+    assert _local_stamp(None) == ""
+
+
+def _scho_record(**over):
+    """remindctl list --json 的真实记录形状（SCHO 那条，只读、只当样本）。"""
+    record = {"alarmDate": REAL_UTC, "creationDate": "2026-11-23T01:19:12Z",
+              "dueDate": REAL_UTC, "dueDateIsAllDay": False,
+              "id": "96777596-FA37-4D77-8F0D-3252D743BCAA", "isCompleted": False,
+              "listName": TEST_LIST, "priority": "none",
+              "title": "卖出至少 103000 港币等额的 SCHO，补充账户内的现金"}
+    record.update(over)
+    return record
+
+
+@pytest.mark.parametrize("method", ["pending", "all"])
+def test_adapter_reads_localize_due_and_alarm(monkeypatch, method):
+    """两条读路径（pending / all）都必须过 `_localize`，漏一条就差 8 小时。"""
+    adapter = RemindctlAdapter()
+    monkeypatch.setattr(adapter, "_run",
+                        lambda args: _Proc(json.dumps([_scho_record()])))
+    call = (lambda: adapter.pending(TEST_LIST)) if method == "pending" else adapter.all
+    item = call()[0]
+    assert item["dueDate"] == "2026-11-23 22:30"
+    assert item["alarmDate"] == "2026-11-23 22:30"
+    assert item["dueDateIsAllDay"] is False
+
+
+def test_adapter_all_day_record_has_no_time(monkeypatch):
+    adapter = RemindctlAdapter()
+    record = _scho_record(dueDate="2026-11-24T16:00:00Z", dueDateIsAllDay=True)
+    record.pop("alarmDate")
+    monkeypatch.setattr(adapter, "_run",
+                        lambda args: _Proc(json.dumps([record])))
+    item = adapter.all()[0]
+    assert item["dueDate"] == "2026-11-25"
+    assert "alarmDate" not in item
+
+
+def test_real_read_write_roundtrip_is_self_consistent(real_list):
+    """写读自洽实证：本地 10:00 写给 remindctl（内部转 UTC），读回来还是本地 10:00。
+
+    这是本卡第 3 条要求：写侧 `_stamp` 送本地墙钟、读侧 `_localize` 换回本地，
+    两个方向必须互逆。实测 EventKit 侧存的是 UTC（+8 时区的 10:00 → 02:00Z）。
+    """
+    adapter = RemindctlAdapter(lists=(real_list,))
+    adapter.ensure_lists()
+    due = datetime.now().replace(second=0, microsecond=0) + timedelta(days=1)
+    rid = adapter.add("pytest 时区往返", due, real_list, advance_minutes=15)
+    assert rid
+    (item,) = [row for row in adapter.pending(real_list) if row["id"] == rid]
+    assert item["dueDate"] == due.strftime("%Y-%m-%d %H:%M")
+    assert item["alarmDate"] == (due - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M")

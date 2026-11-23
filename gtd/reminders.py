@@ -86,6 +86,51 @@ def _stamp(moment) -> str:
     return str(moment)
 
 
+def _parse_utc(value) -> datetime | None:
+    """ISO 8601 UTC 串（带 ``Z`` / ``+00:00``）→ 本地时区 aware datetime。
+
+    认不出给 None；没有时区标的串视为「已经是本地时间」，原样返回 naive
+    datetime —— 绝不能再当 UTC 换一次，否则反向差 8 小时。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is None else dt.astimezone()
+
+
+def _local_stamp(value, *, all_day: bool = False) -> str:
+    """remindctl 读出的 UTC 时间串 → 本地墙钟串（与 `_stamp` 写出去的格式同构）。
+
+    - 非全天：``"YYYY-MM-DD HH:MM"``，例：``2026-11-23T14:30:00Z`` → ``2026-11-23 22:30``
+    - 全天：只留本地日期 ``"YYYY-MM-DD"``（全天没有时刻）。实测 EventKit 把全天
+      存成「本地零点的 UTC」，``--due 2026-11-25`` 读回来是 ``2026-11-24T16:00:00Z``，
+      所以日期必须先换本地再截，否则日期会退一天。
+    - 认不出的串原样返回（不抛、不猜）。
+    """
+    dt = _parse_utc(value)
+    if dt is None:
+        return value if isinstance(value, str) else ""
+    return dt.strftime("%Y-%m-%d") if all_day else dt.strftime(TIME_FMT)
+
+
+def _localize(item: dict) -> dict:
+    """一条 remindctl 记录：``dueDate`` / ``alarmDate`` 换成本地时间，其余字段不动。
+
+    读侧的唯一出口。EventKit 存 UTC，remindctl JSON 原样给 UTC；写侧 `_stamp`
+    送的是本地墙钟（实测 ``--due "10:00"`` → ``dueDate: 02:00Z``），两个方向靠
+    这一对函数自洽。**任何新加的读取路径都必须过这里**，漏一处图上就差 8 小时。
+    """
+    out = dict(item)
+    all_day = bool(item.get("dueDateIsAllDay"))
+    for key in ("dueDate", "alarmDate"):
+        if out.get(key):
+            out[key] = _local_stamp(out[key], all_day=(key == "dueDate" and all_day))
+    return out
+
+
 def _resolve_exe(exe: str) -> str | None:
     """remindctl 路径：PATH 里找不到就兜底几个常见安装位置。
 
@@ -197,14 +242,14 @@ class RemindctlAdapter:
         proc = self._run(["show", "open", "--list", list_name, "--json"])
         if not _ok(proc):
             return []
-        return [item for item in _records(_loads(_out(proc)))
+        return [_localize(item) for item in _records(_loads(_out(proc)))
                 if not item.get("isCompleted")]
 
     def all(self) -> list[dict]:
         proc = self._run(["show", "all", "--json"])
         if not _ok(proc):
             return []
-        return _records(_loads(_out(proc)))
+        return [_localize(item) for item in _records(_loads(_out(proc)))]
 
     def is_available(self) -> bool:
         """remindctl 存在且 status 为 Full access。带超时，失败返回 False。"""
