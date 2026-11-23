@@ -378,5 +378,56 @@ def test_interior_time_is_not_stripped():
     got = p("明天中午前交材料，顺便看看 3 点的会")
     assert got.title == "交材料，顺便看看 3 点的会"
     assert got.due == date(2026, 11, 24)
-    # 注：at 仍按「时刻取最后一个」解析成 15:00（正文里的 3 点也参与），本次不改时刻解析口径
+    # 注（t_93aaa2eb 起）：at 只认句首前缀 → 12:00，正文里的「3 点」不再参与时刻解析
+
+
+# ---------- 61+：句中时间不许参与时刻解析（t_93aaa2eb） ----------
+#
+# 事故：上一条只锁了 title，没锁 at。`明天中午前交材料，顺便看看 3 点的会`
+#      标题是对的，at 却被正文里的「3 点」抢成 15:00（应为中午前 12:00）。
+# 口径：时刻只认**句首时间前缀**里的最后一个；正文中间的时间既不剥、也不算。
+#      前缀只给日期不给钟点 → 当天 22:30（全天截止）。
+
+INTERIOR_TIME = [
+    ("明天中午前交材料，顺便看看 3 点的会", "交材料，顺便看看 3 点的会",
+     date(2026, 11, 24), time(12, 0)),
+    ("明天买材料 下午 3 点开会", "买材料 下午 3 点开会",
+     date(2026, 11, 24), time(22, 30)),
+    ("今天晚上 10 点半美股开盘后，提醒我卖出 SCHO", "美股开盘后，提醒我卖出 SCHO",
+     TODAY, time(22, 30)),
+    ("后天下午 3 点半开会，记得带电脑", "开会，记得带电脑",
+     date(2026, 11, 25), time(15, 30)),
+    ("明早 8 点交材料 10 点开会", "交材料 10 点开会",
+     date(2026, 11, 24), time(8, 0)),
+]
+
+
+@pytest.mark.parametrize("text,title,due,at", INTERIOR_TIME)
+def test_interior_time_does_not_win_the_clock(text, title, due, at):
+    """句中（非句首前缀）的时间只留在标题里，不许抢 due/at。"""
+    got = p(text)
+    assert got.title == title
+    assert got.due == due
+    assert got.at == at
+
+
+def test_prefix_date_only_falls_back_to_all_day_cutoff():
+    """前缀只有日期、没有钟点 → at=22:30（全天截止），不是正文钟点。"""
+    got = p("明天买材料 下午 3 点开会")
+    assert got.at == time(22, 30)
+    assert got.matched == "明天 下午 3 点"      # matched 仍回显全句时间原文，便于调试
+
+
+def test_unresolvable_prefix_date_does_not_borrow_todays_cutoff():
+    """日期解析不出来（13月45日）→ at 不许兜底成今天 22:30，念头该进收件箱。"""
+    got = p("13月45日交材料")
+    assert got.due is None and got.at is None
+
+
+def test_prefix_date_plus_inner_clock_keeps_prefix_clock():
+    """前缀有钟点、正文也有钟点 → 取前缀那个，正文那个只留在标题。"""
+    got = p("明天中午前交材料，3 点开会")
+    assert got.at == time(12, 0)
+    assert got.title == "交材料，3 点开会"
+
 

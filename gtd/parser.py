@@ -4,7 +4,8 @@
 只用标准库 `re` + `datetime`。
 
 老板定的截止点语义：上午→12:00、下午→18:00、晚上/今天→22:30。
-一句话里多个时间词，日期与时刻各取最后一个。
+一句话里多个时间词，日期取全句最后一个；**时刻只认句首时间前缀**里的最后一个，
+正文中间提到的时间既不剥进标题、也不参与时刻解析。
 标题只抠**句首连续的时间前缀**（正文中间提到的时间不动），
 「提前X」是提醒修饰语，出现在哪都抠；时间词之间隔的空格一律容错。
 """
@@ -242,12 +243,24 @@ def _resolve_due(hits: list[_Hit], today: date) -> date | None:
     return due
 
 
-def _resolve_at(hits: list[_Hit]) -> time | None:
+def _has_date(hits: list[_Hit]) -> bool:
+    """前缀里是否给了日期（含「今早/明晚」这类自带日偏移的复合词）。"""
+    return any(hit.kind == "date" or hit.data.get("day_offset") is not None
+               for hit in hits)
+
+
+def _resolve_at(hits: list[_Hit], due: date | None) -> time | None:
+    """时刻只认**句首时间前缀**里的最后一个；只给日期没给时刻 → 当天 22:30 兜底。
+
+    正文里提到的时间（「…顺便看看 3 点的会」）不参与，否则前面给了截止点
+    （中午前=12:00）却会被正文的钟点覆盖掉。兜底只在日期真的解析出来时给，
+    否则「13月45日交材料」这种坏日期会从「进收件箱」变成「排到今天 22:30」。
+    """
     values = [hit.data.get("value") for hit in hits
               if hit.kind == "at" and hit.data.get("value") is not None]
     if values:
         return values[-1]
-    if any(hit.data.get("rel") in ("今天", "今日") for hit in hits):
+    if due is not None and _has_date(hits):
         return DEFAULT_AT
     return None
 
@@ -348,10 +361,11 @@ def parse(text: str, *, now: datetime) -> Parsed:
     hits = _scan(text)
     list_name, extra_spans = _resolve_list(text)
     cut = _strip_hits(text, hits)
+    due = _resolve_due(hits, now.date())
     return Parsed(
         title=_cut_title(text, [(hit.start, hit.end) for hit in cut] + extra_spans),
-        due=_resolve_due(hits, now.date()),
-        at=_resolve_at(hits),
+        due=due,
+        at=_resolve_at(cut, due),
         advance_minutes=_resolve_advance(hits),
         matched=_echo(text, hits),
         list=list_name,
