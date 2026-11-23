@@ -691,6 +691,11 @@ T_GAP = 34
 T_SAFETY = 16
 T_SEQ_W, T_AT_W, T_LIST_W = 54, 146, 110
 T_TAG_W = 130
+# 列表列留白时不占位：`.title` 是 flex:1，只要不渲染那一块，这 110px 自然归标题。
+# 估高也得按同一口径放大标题宽度，否则行数估多、图上多出空白。
+# 列表名与所处区块重复时不印：GTD 是默认列表（Siri 都写它，每行重复就是噪音），
+# inbox 是收件箱区本身（老板原话「列表 GTD 就没必要再显示了呀」）。
+HIDDEN_LIST_NAMES = frozenset({"GTD", "inbox"})
 T_TITLE_W = T_WIDTH - T_PAD_X * 2 - T_SEQ_W - T_AT_W - T_LIST_W - T_TAG_W
 NEXT_LIMIT = 5                   # 「接下来」区最多 5 条，超出折一行「还有 N 条」
 NEXT_DAYS = 7                    # 未来 7 天以内（含第 7 天）才进「接下来」
@@ -701,6 +706,8 @@ SECTION_ORDER = ("today", "next", "far", "inbox")
 T_WHEN_W = T_SEQ_W + T_AT_W      # 200：「号 + 周五 15:30」正好占序号 + 时刻两列
 T_NEXT_LABEL_H = 40
 T_MORE_H = 34
+# 收件箱区视觉隔离（方案 B）：浅底 + 上方细线，不加任何文字标签。18 + 6 = padding 高。
+T_INBOX_BAND_H = 24
 ALL_DAY_LABEL = "全天"
 # 时段闹钟回显成老板说出口的那个词：146px 的 nowrap 列放不下「全天 · 12:00 响」
 ALARM_LABELS = {time(12, 0): "上午", time(18, 0): "下午"}
@@ -829,12 +836,28 @@ def _shown_title(entry: Entry) -> str:
     return f"{title}（{cycle}）" if cycle else title
 
 
+def list_label(entry: Entry) -> str:
+    """右侧列表列该印的字；``GTD`` 与收件箱条目返回空串（= 不印、不占位）。
+
+    PNG 的行与 Markdown 的表格列都调这一处，别再各写一遍（上次分区顺序就是这么出错的）。
+    """
+    if entry.kind == "inbox" or entry.list_name in HIDDEN_LIST_NAMES:
+        return ""
+    return entry.list_name
+
+
+def _list_html(entry: Entry) -> str:
+    """列表列：留空就整块不渲染，标题把宽度吃下来（不留一块空白把标题挤窄）。"""
+    label = list_label(entry)
+    return f'<div class="list">{html.escape(label)}</div>' if label else ""
+
+
 def _next_row(entry: Entry) -> str:
     """接下来区的一行：号是当天固定的图上号，印在日期前缀左边（同一套样式）。"""
     return ('<div class="row">'
             f'<div class="when"><span class="seq">{entry.number}</span>{html.escape(_next_when(entry))}</div>'
             f'<div class="title">{html.escape(_shown_title(entry))}</div>'
-            f'<div class="list">{html.escape(entry.list_name)}</div>'
+            f'{_list_html(entry)}'
             '</div>')
 
 
@@ -910,7 +933,7 @@ def _entry_row(entry: Entry, now: datetime) -> str:
             f'{_at_html(entry, now)}'
             f'<div class="title">{html.escape(_shown_title(entry))}</div>'
             f'{_tag_html(entry)}'
-            f'<div class="list">{html.escape(entry.list_name)}</div>'
+            f'{_list_html(entry)}'
             '</div>')
 
 
@@ -921,9 +944,14 @@ def _rows_block(css_class: str, entries: list[Entry], now: datetime) -> str:
     return f'<div class="{css_class}">{rows}</div>'
 
 
+def _title_width(entry: Entry) -> int:
+    """标题可用宽度：右侧不印列表列时，那 110px 归标题（不按老宽度估行数）。"""
+    return T_TITLE_W if list_label(entry) else T_TITLE_W + T_LIST_W
+
+
 def _title_lines(entry: Entry) -> int:
     px = sum(31 if ord(ch) > 127 else 16 for ch in _shown_title(entry))
-    return max(1, math.ceil(px / T_TITLE_W))
+    return max(1, math.ceil(px / _title_width(entry)))
 
 
 def _rows_height(entries: list[Entry]) -> int:
@@ -973,7 +1001,8 @@ def _page_sections(entries: list[Entry], now: datetime):
         "today": (_rows_block("rows", upper, now), _rows_height(upper)),
         "next": _next_block(upcoming),
         "far": _far_block(far),
-        "inbox": (_rows_block("lower", lower, now), _rows_height(lower)),
+        "inbox": (_rows_block("lower", lower, now),
+                  _rows_height(lower) + (T_INBOX_BAND_H if lower else 0)),
     }
     return [(name, made[name][0], made[name][1]) for name in SECTION_ORDER]
 
@@ -1067,27 +1096,36 @@ def _far_when(entry: Entry) -> str:
     return f"{stamp} {clock.strftime('%H:%M')}" if clock else stamp
 
 
+def _md_entry_table(when_head: str, entries: list[Entry], when_fn) -> str:
+    """今日/接下来/更远共用的表：``| # | 时刻 | 标题 | [列表] |``。
+
+    「列表」列按 ``list_label()`` 定：整区一条可印的都没有（全 GTD / 全是收件箱）就
+    **整列不出现**（标题自然变宽），有 Waiting 这类的才补上这一列、其余格留空。
+    """
+    show_list = any(list_label(entry) for entry in entries)
+    head = (when_head, "标题", "列表") if show_list else (when_head, "标题")
+    rows = []
+    for entry in entries:
+        cells = (str(entry.number), when_fn(entry), _md_title(entry))
+        rows.append(cells + (list_label(entry),) if show_list else cells)
+    return _md_table(head, rows)
+
+
 def _md_next_block(upcoming: list[Entry]) -> str:
     """「接下来」区**全量**上表（老板要全量：50 条也不截断、不写「还有 N 条」）。"""
-    rows = [(str(entry.number), _next_when(entry), _md_title(entry), entry.list_name)
-            for entry in upcoming]
-    return _md_table(("日期时刻", "标题", "列表"), rows)
+    return _md_entry_table("日期时刻", upcoming, _next_when)
 
 
 def _md_far_block(far: list[Entry]) -> str:
     """「更远」区全量上表：日期升序，号照 ``board_index`` 原样印。"""
-    rows = [(str(entry.number), _far_when(entry), _md_title(entry), entry.list_name)
-            for entry in far]
-    return _md_table(("日期", "标题", "列表"), rows)
+    return _md_entry_table("日期", far, _far_when)
 
 
 def _md_today_block(upper: list[Entry]) -> str:
     """今日表（含逾期）；空区返回空串。"""
     if not upper:
         return ""
-    rows = [(str(entry.number), _when_text(entry), _md_title(entry), entry.list_name)
-            for entry in upper]
-    return _md_table(("时刻", "标题", "列表"), rows)
+    return _md_entry_table("时刻", upper, _when_text)
 
 
 def _md_inbox_block(lower: list[Entry]) -> str:
@@ -1225,7 +1263,8 @@ TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
   .top b { font-weight: 600; color: #6b6259; font-variant-numeric: tabular-nums; }
   .top .sep { margin: 0 16px; color: #cfc7bd; }
   .rows { margin-top: 34px; }
-  .lower { margin-top: 34px; }
+  .lower { margin: 44px -64px 0; padding: 18px 64px 6px; background: #f1ede4;
+           border-top: 1px solid #cfc7bd; }
   .next { margin-top: 34px; }
   .far { margin-top: 34px; }
   .label { font-size: 22px; color: #8a8078; letter-spacing: .14em; margin-bottom: 2px; }

@@ -161,9 +161,14 @@ def test_page_has_no_ui_furniture_words():
 
 
 def test_page_has_no_table_or_card_decoration():
+    """不许表格线/卡片；全页唯一的边框是收件箱区那条隔离细线（方案 B，2026-11-23）。"""
     page, *_ = build_today_html(FIVE, now=NOW)
     assert "<table" not in page and "<button" not in page
-    assert "border:" not in page and "border-top" not in page, "不许有表格线/卡片边框"
+    css = page.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert re.search(r"\.lower \{[^}]*border-top: 1px solid #cfc7bd", css), "收件箱区上方一条细线"
+    borders = [item for item in re.findall(r"border[-a-z]*:\s", css) if item != "border-radius: "]
+    assert borders == ["border-top: "], "除那条隔离线外不许有边框（不画卡片）"
+    assert re.search(r"\.tag \{[^}]*border-radius: 6px", css), "圆角只有逾期标签那个小药丸"
 
 
 # ---------- 排序、红褐色时刻、转义 ----------
@@ -380,18 +385,20 @@ def md_rows(text: str) -> list[str]:
             if line.startswith("| ") and not line.startswith("| # |")]
 
 
-def test_markdown_today_row_has_number_clock_title_list():
+def test_markdown_today_row_has_number_clock_title():
+    """GTD 是默认列表：右侧不印列表名，表里连「列表」列都不出现（2026-11-23 改）。"""
     text = md([entry("卖出 ≥550 股 SCHO", number=1, at=time(22, 30))])
     assert "**今天 1 件 · 逾期 0 件 · 收件箱 0 条**" in text
-    assert "| # | 时刻 | 标题 | 列表 |" in text
-    assert "| 1 | 22:30 | 卖出 ≥550 股 SCHO | GTD |" in text
+    assert "| # | 时刻 | 标题 |" in text
+    assert "| 1 | 22:30 | 卖出 ≥550 股 SCHO |" in text
+    assert "GTD" not in text
 
 
 def test_markdown_next_section_carries_weekday_and_clock():
     text = md([later("把小米 SU7 送 4S 店保养", days=4, number=3, at=time(16, 0))])
     assert "**接下来**" in text
-    assert "| # | 日期时刻 | 标题 | 列表 |" in text
-    assert "| 3 | 周五 16:00 | 把小米 SU7 送 4S 店保养 | GTD |" in text
+    assert "| # | 日期时刻 | 标题 |" in text
+    assert "| 3 | 周五 16:00 | 把小米 SU7 送 4S 店保养 |" in text
 
 
 def test_markdown_all_day_morning_afternoon_words():
@@ -404,14 +411,14 @@ def test_markdown_all_day_morning_afternoon_words():
 
 def test_markdown_overdue_appends_days_to_title():
     text = md([entry("昨天该做完的", number=2, at=time(18, 0), overdue_days=2)])
-    assert "| 2 | 18:00 | 昨天该做完的（逾期 2 天） | GTD |" in text
+    assert "| 2 | 18:00 | 昨天该做完的（逾期 2 天） |" in text
 
 
 def test_markdown_empty_sections_are_not_rendered():
     """只有收件箱一条：不出现「接下来」标题、不出现时刻表；今天表也不渲染。"""
     text = md([entry("想到一个点子", number=1, kind="inbox")])
     assert "**接下来**" not in text
-    assert "| # | 时刻 | 标题 | 列表 |" not in text
+    assert "| # | 时刻 | 标题 |" not in text
     assert "**收件箱**" in text
     assert "| 1 | 想到一个点子 |" in text
 
@@ -434,12 +441,12 @@ def test_markdown_next_lists_everything_without_folding():
     text = md(rows)
     assert len(md_rows(text)) == 7
     assert "还有" not in text
-    assert "| 8 | 周一 09:00 | 第7天 | GTD |" in text
+    assert "| 8 | 周一 09:00 | 第7天 |" in text
 
 
 def test_markdown_escapes_pipes_in_titles():
     text = md([entry("A | B", number=1, at=time(9, 0))])
-    assert r"A \| B" in text and r"| 1 | 09:00 | A \| B | GTD |" in text
+    assert r"A \| B" in text and r"| 1 | 09:00 | A \| B |" in text
 
 
 def test_json_view_is_structured_with_numbers():
@@ -527,7 +534,7 @@ def test_board_order_puts_important_inbox_thoughts_first():
 def test_markdown_periodic_title_shows_cycle_after_title():
     """「每 5 天」的条目：标题后括注，Markdown 表格里一眼能看出来。"""
     text = md([entry("拼多多领券", number=1, repeat="every 5 days")])
-    assert "| 1 |  | 拼多多领券（每 5 天） | GTD |" in text
+    assert "| 1 |  | 拼多多领券（每 5 天） |" in text
 
 
 def test_markdown_named_cycles_use_chinese_words():
@@ -627,17 +634,17 @@ def test_markdown_far_lists_all_with_full_dates():
                          alarm=time(12, 0)),
                far_entry("老爸生日", date_=date(2027, 3, 10), number=9, all_day=True)])
     assert "**更远**" in text
-    assert "| # | 日期 | 标题 | 列表 |" in text
+    assert "| # | 日期 | 标题 |" in text
     assert md_rows(text) == [
-        "| 8 | 2027-03-01 12:00 | 大白年检 | GTD |",
-        "| 9 | 2027-03-10 | 老爸生日 | GTD |",
-        "| 5 | 2027-10-03 21:00 | 取消Darkroom的订阅 | GTD |",
+        "| 8 | 2027-03-01 12:00 | 大白年检 |",
+        "| 9 | 2027-03-10 | 老爸生日 |",
+        "| 5 | 2027-10-03 21:00 | 取消Darkroom的订阅 |",
     ], md_rows(text)
 
 
 def test_markdown_far_keeps_priority_marks_and_pipes_escaped():
     text = md([far_entry("A | B", date_=date(2027, 3, 1), number=7, priority="high")])
-    assert "| 7 | 2027-03-01 | !!! A \\| B | GTD |" in text
+    assert "| 7 | 2027-03-01 | !!! A \\| B |" in text
 
 
 def test_json_view_carries_far_items():
@@ -648,4 +655,93 @@ def test_json_view_carries_far_items():
     assert [item["number"] for item in data["far"]] == [8, 5]
     assert [item["when"] for item in data["far"]] == ["2027-03-01", "2027-10-03 21:00"]
     assert data["summary"]["today"] == 0, "更远的不许混进「今天」那一格"
+
+
+# ---------- 15. 列表列瘦身 + 收件箱视觉隔离（2026-11-23） ----------
+#
+# 老板原话：「列表 GTD 就没必要再显示了呀」。GTD 是默认列表（Siri 都写它）、inbox 就是
+# 收件箱区本身，两个名字印在每行右侧都是重复噪音 → 留空且不占位（标题把宽度吃下来）。
+# 收件箱区改成「浅底 + 上方一条细线」的隔离（方案 B），不靠加文字标签提醒。
+
+def test_gtd_list_name_is_not_printed():
+    """GTD 条目右侧不印列表名，整块 `.list` 不渲染（不是印个空 div 占位）。"""
+    page, *_ = build_today_html([entry("卖出 ≥550 股 SCHO", list_name="GTD")], now=NOW)
+    assert '<div class="list">' not in page
+    assert "GTD" not in visible(page)
+
+
+def test_waiting_list_name_still_printed():
+    """不属于默认列表的（目前就是 Waiting）照旧印出来。"""
+    page, *_ = build_today_html([entry("把小米 SU7 送 4S 店保养", list_name="Waiting")], now=NOW)
+    assert '<div class="list">Waiting</div>' in page
+
+
+def test_inbox_entry_has_no_list_label():
+    """收件箱条目本来就在「收件箱」区：`inbox` 那三个字也是重复的，一并留空。"""
+    page, *_ = build_today_html([entry("对腾讯的 Q3 财报进行综合分析", kind="inbox")], now=NOW)
+    assert '<div class="list">' not in page
+    assert "inbox" not in visible(page).lower()
+
+
+def test_hidden_list_column_gives_width_back_to_title():
+    """留空后标题变宽：同样长的标题，GTD 条目占的行数不多于 Waiting 条目。"""
+    from gtd.render import _title_lines
+    long_title = "把小米汽车送去店里做一次完整保养检查"        # 18 个汉字 ≈ 558px
+    assert _title_lines(entry(long_title, list_name="GTD")) < \
+        _title_lines(entry(long_title, list_name="Waiting"))
+    _p1, _w1, gtd_height = build_today_html([entry(long_title, list_name="GTD")], now=NOW)
+    _p2, _w2, waiting_height = build_today_html([entry(long_title, list_name="Waiting")], now=NOW)
+    assert gtd_height < waiting_height, "估高也按「列表列不占位」算，别按老宽度多留白"
+
+
+def test_markdown_drops_list_column_when_all_hidden():
+    """整区都是 GTD：Markdown 连「列表」列都不出现（不留一列空格子）。"""
+    text = md([entry("卖出 ≥550 股 SCHO", number=1, at=time(22, 30))])
+    assert "| # | 时刻 | 标题 |" in text
+    assert "列表 |" not in text and "GTD" not in text
+
+
+def test_markdown_keeps_list_column_for_waiting_and_blanks_gtd_rows():
+    """一区里有 Waiting 就保留「列表」列，GTD 那几行这一格留空。"""
+    text = md([entry("给车做保养", number=1, at=time(9, 0)),
+               entry("等对方回话", number=2, at=time(10, 0), list_name="Waiting")])
+    assert "| # | 时刻 | 标题 | 列表 |" in text
+    assert "| 1 | 09:00 | 给车做保养 |  |" in text
+    assert "| 2 | 10:00 | 等对方回话 | Waiting |" in text
+    assert "GTD" not in text
+
+
+def _lower_block(page: str) -> str:
+    """只取收件箱区（`.lower`）那一段 HTML。"""
+    return page.split('<div class="lower">', 1)[1].split('<div class="foot"', 1)[0]
+
+
+def test_inbox_section_is_isolated_by_light_band_and_hairline():
+    """方案 B：极浅米灰底 + 上方 1px 细线，不加任何文字标签、不做卡片。"""
+    page, *_ = build_today_html([entry("今天的事", number=1),
+                                 entry("想到一个点子", number=2, kind="inbox")], now=NOW)
+    css = page.split("<style>", 1)[1].split("</style>", 1)[0]
+    rule = re.search(r"\.lower \{([^}]*)\}", css)
+    assert rule is not None, "收件箱区必须有自己的一条样式"
+    band = rule.group(1)
+    assert "background: #f1ede4" in band, "整区铺极浅米灰底（页面底是 #f7f5f0）"
+    assert "border-top: 1px solid #cfc7bd" in band, "上方一条细线，用现有分隔色"
+    assert "border-radius" not in band, "不做卡片"
+    assert re.sub(r"<[^>]+>", "", _lower_block(page)).strip() == "2想到一个点子", \
+        "隔离靠底色：收件箱区里不许出现任何新增文字标签"
+
+
+def test_inbox_band_is_not_rendered_without_inbox_entries():
+    """收件箱 0 条时整块不渲染：不留一条孤零零的浅色带（估高也不加它的 padding）。"""
+    page, _w, _h = build_today_html([entry("今天的事", number=1)], now=NOW)
+    assert 'class="lower"' not in page
+
+
+def test_inbox_band_keeps_text_colors_unchanged():
+    """加了底色后文字对比度不许变差：标题/序号的配色一个都没动。"""
+    page, *_ = build_today_html([entry("想到一个点子", number=2, kind="inbox")], now=NOW)
+    css = page.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert re.search(r"body \{[^}]*color: #1b1815", css), "正文仍是原墨色"
+    assert re.search(r"\.seq \{[^}]*color: #c3b9ae", css), "序号灰不变"
+    assert re.search(r"\.title \{ flex: 1; font-size: 31px", css), "标题字号不变"
 
