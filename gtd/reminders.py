@@ -20,6 +20,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Protocol, runtime_checkable
 
 from . import priority as prio
+from . import repeat as rep
 from .priority import PRIORITY_NONE
 
 DEFAULT_LISTS = ("GTD", "Waiting")
@@ -64,17 +65,27 @@ class ReminderStore(Protocol):
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
             all_day: bool = False, slot: str | None = None,
-            priority: str = PRIORITY_NONE) -> str:
+            priority: str = PRIORITY_NONE,
+            repeat: str | None = None) -> str:
         """新建一条提醒，返回 id；失败返回 ""。
 
         ``all_day=True`` → due 只给日期（整天挂锁屏）；``slot``（am / pm）→ 同样
         due 全天，另外挂 12:00 / 18:00 的闹钟到点响一次。``priority`` 是 Reminders.app
         的原生四档（none/low/medium/high），写进 Reminder 后手机上也能看到感叹号。
+        ``repeat`` 是 Reminders 原生重复（``daily`` / ``every 5 days`` …），写进去后
+        完成那一刻 EventKit 自己把下一次（原 id、due +N）滚出来。
         """
         ...
 
     def complete(self, reminder_id: str) -> bool:
         """标记完成；失败返回 False。"""
+        ...
+
+    def set_priority(self, reminder_id: str, level: str) -> bool:
+        """改一条提醒的优先级（none/low/medium/high）；失败返回 False。
+
+        ``none`` 也是合法值（等于清掉标记），所以四档全传——与 ``add`` 不同。
+        """
         ...
 
     def delete(self, reminder_id: str) -> bool:
@@ -172,6 +183,7 @@ def _localize(item: dict) -> dict:
     all_day = bool(item.get("dueDateIsAllDay"))
     out["all_day"] = all_day            # 上层只认这个标记：全天条目「没有时刻」
     out["priority"] = prio.normalize(item.get("priority"))   # 四档归一，缺省 none
+    out["repeat"] = rep.from_rule(item.get("recurrenceRule"))  # 周期归一，一次性 = None
     for key in ("dueDate", "alarmDate"):
         if out.get(key):
             out[key] = _local_stamp(out[key], all_day=(key == "dueDate" and all_day))
@@ -197,6 +209,18 @@ def _resolve_exe(exe: str) -> str | None:
 
 def _ok(proc) -> bool:
     return proc is not None and proc.returncode == 0
+
+
+def _completed_or_rolled(item: dict, reminder_id: str) -> bool:
+    """这一条是「真完成了」还是「周期任务被滚到下一轮」——两者都算 complete 成功。
+
+    周期任务完成时 remindctl 返回同 id、isCompleted=false、已 +N 的那条；普通任务
+    返回同 id、isCompleted=true。既没完成、又没有周期规则的，一律当失败。
+    """
+    if item.get("isCompleted"):
+        return True
+    return (str(item.get("id")) == str(reminder_id)
+            and bool(item.get("recurrenceRule") or item.get("repeat")))
 
 
 def _out(proc) -> str:
@@ -253,13 +277,15 @@ class RemindctlAdapter:
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
             all_day: bool = False, slot: str | None = None,
-            priority: str = PRIORITY_NONE) -> str:
+            priority: str = PRIORITY_NONE,
+            repeat: str | None = None) -> str:
         """新建一条提醒，返回 id；失败返回 ""。
 
         `advance_minutes`：提前几分钟响铃（alarm = due_at - advance）；
         传 0 = 到点即响，传 None = 不设闹钟（--alarm 不出现）。
         `all_day` / `slot`：due 只送日期（全天）；`slot=am/pm` 再挂 12:00/18:00 闹钟。
         `priority`：none/low/medium/high，非 none 才传 ``--priority``（与 Reminders.app 同档）。
+        `repeat`：Reminders 原生重复，认得才传 ``--repeat``（不认得就不传）。
         """
         _guard_list(list_name)
         due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
@@ -273,23 +299,37 @@ class RemindctlAdapter:
             args += ["--url", url]
         if prio.is_set(priority):
             args += ["--priority", prio.normalize(priority)]
+        if rep.is_set(repeat):
+            args += ["--repeat", rep.normalize(repeat)]
         proc = self._run(args + ["--json"])
         if not _ok(proc):
             return ""
         return _id_of(_loads(_out(proc)))
 
     def complete(self, reminder_id: str) -> bool:
+        """标记完成；**周期任务**完成那一刻 EventKit 会把同一条滚到下个周期。
+
+        实测（t_82fc1c49，真机）：对 ``--repeat`` 的提醒调 complete，返回的是
+        **同 id、isCompleted=false、dueDate 已 +N** 的那条（另生成一条已完成的历史
+        快照，新 id）。所以「成功」不能只看 isCompleted —— 同 id 且带周期规则的滚动
+        也算完成；不带周期的原样返回仍算失败。
+        """
         proc = self._run(["complete", str(reminder_id), "--json"])
         if not _ok(proc):
             return False
         data = _loads(_out(proc))
         if data is None:
             return True          # 输出不可解析时以 rc 为准
-        return any(item.get("isCompleted") for item in _records(data))
+        return any(_completed_or_rolled(item, reminder_id) for item in _records(data))
 
     def delete(self, reminder_id: str) -> bool:
         proc = self._run(["delete", str(reminder_id), "--force", "--json"])
         return _ok(proc)
+
+    def set_priority(self, reminder_id: str, level: str) -> bool:
+        """``remindctl edit <id> --priority <level>``；rc 为准，输出不可解析也算成功。"""
+        args = ["edit", str(reminder_id), "--priority", prio.normalize(level), "--json"]
+        return _ok(self._run(args))
 
     def pending(self, list_name: str) -> list[dict]:
         _guard_list(list_name)
@@ -345,7 +385,8 @@ class FakeStore:
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
             all_day: bool = False, slot: str | None = None,
-            priority: str = PRIORITY_NONE) -> str:
+            priority: str = PRIORITY_NONE,
+            repeat: str | None = None) -> str:
         _guard_list(list_name)
         self._seq += 1
         reminder_id = f"fake-{self._seq:04d}"
@@ -362,6 +403,7 @@ class FakeStore:
             "notes": note,
             "url": url,
             "priority": prio.normalize(priority),
+            "repeat": rep.normalize(repeat) or "",
             "isCompleted": False,
         }
         return reminder_id
@@ -375,6 +417,13 @@ class FakeStore:
 
     def delete(self, reminder_id: str) -> bool:
         return self._items.pop(str(reminder_id), None) is not None
+
+    def set_priority(self, reminder_id: str, level: str) -> bool:
+        item = self._items.get(str(reminder_id))
+        if item is None:
+            return False
+        item["priority"] = prio.normalize(level)
+        return True
 
     def pending(self, list_name: str) -> list[dict]:
         _guard_list(list_name)
@@ -391,11 +440,12 @@ def schedule(store: ReminderStore, title: str, due_at,
              list_name: str = "GTD",
              advance_minutes: int | None = None,
              all_day: bool = False, slot: str | None = None,
-             priority: str = PRIORITY_NONE) -> str:
+             priority: str = PRIORITY_NONE,
+             repeat: str | None = None) -> str:
     """上层函数的样板：只依赖 Protocol，不依赖具体实现。
 
     真实运行时传 RemindctlAdapter，测试时传 FakeStore，行为一致。
     """
     store.ensure_lists()
     return store.add(title, due_at, list_name, advance_minutes,
-                     all_day=all_day, slot=slot, priority=priority)
+                     all_day=all_day, slot=slot, priority=priority, repeat=repeat)

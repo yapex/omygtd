@@ -22,10 +22,10 @@ NOW = datetime(2026, 11, 23, 21, 40)          # 周一晚上 21:40
 
 
 def entry(title, *, number=1, at=None, list_name="GTD", overdue_days=0, kind="task",
-          due=None, ref="", priority="none"):
+          due=None, ref="", priority="none", repeat=None):
     return Entry(number=number, title=title, at=at, list_name=list_name,
                  overdue_days=overdue_days, kind=kind, due=due, ref=ref,
-                 priority=priority)
+                 priority=priority, repeat=repeat)
 
 
 def later(title, *, days, number=2, at=None, list_name="GTD", ref="", priority="none"):
@@ -515,3 +515,41 @@ def test_board_order_puts_important_inbox_thoughts_first():
     entries = [entry("普通念头", number=4, kind="inbox"),
                entry("重要念头", number=5, kind="inbox", priority="high")]
     assert [e.title for e in board_order(entries, now=NOW)][-2:] == ["重要念头", "普通念头"]
+
+
+# ---------- 周期标记：标题后「（每 5 天）」，图与文字同一口径 ----------
+
+def test_markdown_periodic_title_shows_cycle_after_title():
+    """「每 5 天」的条目：标题后括注，Markdown 表格里一眼能看出来。"""
+    text = md([entry("拼多多领券", number=1, repeat="every 5 days")])
+    assert "| 1 |  | 拼多多领券（每 5 天） | GTD |" in text
+
+
+def test_markdown_named_cycles_use_chinese_words():
+    text = md([entry("复盘", number=1, repeat="weekly"),
+               entry("换床单", number=2, repeat="biweekly")])
+    assert "复盘（每周）" in text and "换床单（每两周）" in text
+
+
+def test_png_html_periodic_title_shows_cycle_after_title():
+    page, _w, _h = build_today_html([entry("拼多多领券", number=1, repeat="every 5 days")],
+                                    now=NOW)
+    assert "拼多多领券（每 5 天）" in visible(page)
+
+
+def test_one_off_entry_has_no_cycle_marker():
+    """一次性任务不许凭空多出括号（回归：别把空周期印成「（）」）。"""
+    text = md([entry("买菜", number=1)])
+    assert "买菜" in text and "（）" not in text
+
+
+def test_periodic_and_overdue_both_print():
+    """周期括注与逾期括注同时在：先周期、后逾期，两个都不丢。"""
+    text = md([entry("领券", number=1, overdue_days=2, repeat="every 5 days")])
+    assert "领券（每 5 天）（逾期 2 天）" in text
+
+
+def test_json_view_item_carries_repeat():
+    data = json.loads(render_today_json([entry("领券", number=1, repeat="every 5 days")],
+                                        now=NOW))
+    assert data["today"][0]["repeat"] == "every 5 days"

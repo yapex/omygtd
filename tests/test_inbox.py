@@ -213,6 +213,7 @@ def test_16_all_returns_complete_fields(mirror):
     assert mirror.all() == [{
         "reminder_id": "a", "title": "买菜", "list_name": "购物",
         "due_at": "2026-11-23T18:00:00", "completed": 1,
+        "priority": "none",
         "synced_at": "2026-11-23T09:00:00",
     }]
 

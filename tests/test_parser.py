@@ -547,3 +547,90 @@ def test_importance_compound_words_are_not_touched():
         assert got.title == expected, text
 
 
+
+
+# ---------- 重复说法：Reminder 原生 repeat（t_82fc1c49） ----------
+
+def test_repeat_every_n_days_sets_cycle_and_due():
+    """「每 5 天 拼多多领券」→ every 5 days；没给日期就 due = 今天 + 5；标题剥干净。"""
+    got = p("每 5 天 拼多多领券")
+    assert got.repeat == "every 5 days"
+    assert got.title == "拼多多领券"
+    assert got.due == date(2026, 11, 28)
+    assert got.all_day is True
+
+
+@pytest.mark.parametrize("text,value,expected", [
+    ("每天 记账", "daily", date(2026, 11, 24)),
+    ("天天 背单词", "daily", date(2026, 11, 24)),
+    ("每周 复盘", "weekly", date(2026, 11, 30)),
+    ("每星期 大扫除", "weekly", date(2026, 11, 30)),
+    ("每月 交房租", "monthly", date(2026, 12, 23)),
+    ("每年 体检", "yearly", date(2027, 11, 23)),
+])
+def test_repeat_named_phrases(text, value, expected):
+    """六个固定说法 → 各自的值；due 按周期从今天往后推一轮（月份走日历）。"""
+    got = p(text)
+    assert got.repeat == value
+    assert got.title == text.split(" ", 1)[1]
+    assert got.due == expected
+
+
+def test_repeat_biweekly_spellings():
+    """「每两周」「隔周」都是 biweekly，due = 今天 + 14 天。"""
+    for text in ("每两周 换床单", "隔周 对账"):
+        got = p(text)
+        assert got.repeat == "biweekly", text
+        assert got.due == date(2026, 12, 7), text
+
+
+def test_repeat_every_n_weeks_and_months():
+    """「每 N 周 / 每 N 个月」按 N 往后推，和固定说法重名也不打架。"""
+    weeks = p("每 3 周 洗车")
+    assert weeks.repeat == "every 3 weeks" and weeks.due == date(2026, 12, 14)
+    months = p("每 2 个月 换滤芯")
+    assert months.repeat == "every 2 months" and months.due == date(2027, 1, 23)
+
+
+def test_repeat_with_explicit_date_keeps_that_due():
+    """既有「每 5 天」又有具体日期：重复规则照认，due 用解析出的日期。"""
+    got = p("每 5 天，下次 11-25 领券")
+    assert got.repeat == "every 5 days"
+    assert got.due == date(2026, 11, 25)
+    assert "领券" in got.title
+
+
+def test_repeat_at_tail_is_stripped():
+    """「拼多多领券 每 5 天」：句尾的周期词也要剥，标题不许带周期。"""
+    got = p("拼多多领券 每 5 天")
+    assert got.title == "拼多多领券" and got.repeat == "every 5 days"
+
+
+def test_repeat_inside_sentence_keeps_title_intact():
+    """正文里的「优惠券每 5 天刷新一次」：照认周期，但标题原样（剥了就变病句）。"""
+    got = p("优惠券每 5 天刷新一次")
+    assert got.repeat == "every 5 days"
+    assert got.title == "优惠券每 5 天刷新一次"
+    assert got.due == date(2026, 11, 28)
+
+
+def test_weekday_phrase_is_not_a_repeat():
+    """「每周五」是星期几，不是周期：不许误判成 weekly，也不许抢日期。"""
+    got = p("每周五 开会")
+    assert got.repeat is None
+    assert got.due == date(2026, 11, 27)
+
+
+def test_one_off_task_has_no_repeat():
+    got = p("今天买菜")
+    assert got.repeat is None
+
+
+def test_repeat_combines_with_time_and_priority():
+    """周期 + 钟点 + 重要性同时出现：三样各归各位，标题只剩正文。"""
+    got = p("明天下午3点 每 2 周 重要 例会")
+    assert got.repeat == "every 2 weeks"
+    assert got.title == "例会"
+    assert got.at == time(15, 0)
+    assert got.due == date(2026, 11, 24)
+    assert got.priority == "medium"

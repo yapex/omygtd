@@ -797,11 +797,93 @@ def test_priority_rejects_level_outside_the_four(capsys, db, fake, tmp_path, mon
     assert "none/low/medium/high" in data["error"]
 
 
-def test_priority_rejects_a_reminder_number(capsys, db, fake, tmp_path, monkeypatch):
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+def test_priority_sets_a_next_area_reminder_and_syncs_the_mirror(capsys, db, fake, tmp_path,
+                                                                 monkeypatch):
+    """接下来区的号也能设：改 Reminder 那条 + 本地镜像跟着变。"""
+    rid = fake.add("交材料", datetime(2026, 11, 24, 12, 0), "GTD")
     assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
-    assert code == 1 and "只有收件箱条目能设优先级" in data["error"]
+    assert code == 0 and data["ok"] is True
+    assert data["source"] == "reminder" and data["priority"] == "high"
+    assert data["mark"] == "!!!" and data["previous"] == "none"
+    assert "unchanged" not in data and "warnings" not in data
+    assert fake.all()[0]["priority"] == "high"
+    assert rows(db, "select priority from mirror where reminder_id=?", rid) == [
+        {"priority": "high"}]
+    _, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert "| 1 | 周二 12:00 | !!! 交材料 | GTD |" in text
+
+
+def test_priority_sets_a_today_area_reminder_to_medium(capsys, db, fake, tmp_path, monkeypatch):
+    """今天区的号同样认：medium → 两个感叹号。"""
+    rid = fake.add("交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
+    code, data = run(capsys, ["priority", "1", "medium"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True and data["mark"] == "!!"
+    assert fake.all()[0]["priority"] == "medium"
+    assert rows(db, "select priority from mirror where reminder_id=?", rid) == [
+        {"priority": "medium"}]
+    _, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert "| 1 | 12:00 | !! 交材料 | GTD |" in text
+
+
+def test_priority_on_a_reminder_is_idempotent(capsys, db, fake, tmp_path, monkeypatch):
+    """同一档重复设不报错：ok:true + unchanged:true，且不再写 Reminder。"""
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD", priority="high")
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True and data["unchanged"] is True
+    assert data["previous"] == "high" and data["mark"] == "!!!"
+    assert fake.all()[0]["priority"] == "high"
+
+
+def test_priority_none_clears_a_reminder_priority(capsys, db, fake, tmp_path, monkeypatch):
+    """none 也是四档之一：把 Reminder 上的感叹号清掉。"""
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD", priority="high")
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    code, data = run(capsys, ["priority", "1", "none"], db=db, store=fake)
+    assert code == 0 and data["previous"] == "high" and data["mark"] == ""
+    assert fake.all()[0]["priority"] == "none"
+    _, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert "! 交材料" not in text and "交材料" in text
+
+
+def test_priority_rejects_a_completed_reminder_number(capsys, db, fake, tmp_path, monkeypatch):
+    """号在图上但那一条已经完成 → 1 号已完成，不许改。"""
+    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    fake.complete(rid)
+    code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
+    assert code == 1 and data["ok"] is False
+    assert "1 号已经完成了" in data["error"]
+    assert fake.all()[0]["priority"] == "none"
+
+
+def test_priority_rejects_a_reminder_that_left_the_store(capsys, db, fake, tmp_path,
+                                                        monkeypatch):
+    """号在图上、Reminder 里已经删掉（手机上删的）→ 报「不在 Reminder 里了」。"""
+    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake_board(capsys, db, fake, tmp_path, monkeypatch)
+    fake.delete(rid)
+    code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
+    assert code == 1 and data["ok"] is False
+    assert "1 号已经不在 Reminder 里了" in data["error"]
+
+
+def test_priority_reports_reminder_write_failure(capsys, db, no_guard, tmp_path, monkeypatch):
+    """Reminder 写失败要报错退出 1，镜像不许先改（否则备份比真相新）。"""
+    class LockedStore(FakeStore):
+        def set_priority(self, reminder_id, level) -> bool:
+            return False
+
+    store = LockedStore(lists=("GTD", "Waiting"))
+    rid = store.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake_board(capsys, db, store, tmp_path, monkeypatch)
+    code, data = run(capsys, ["priority", "1", "high"], db=db, store=store)
+    assert code == 1 and data["ok"] is False and "没改成" in data["error"]
+    assert store.all()[0]["priority"] == "none"
+    assert rows(db, "select priority from mirror where reminder_id=?", rid) == [
+        {"priority": "none"}]
 
 
 def test_priority_rejects_unknown_number(capsys, db, fake, tmp_path, monkeypatch):
@@ -831,3 +913,47 @@ def test_clarify_carries_inbox_priority_into_reminder(capsys, db, fake):
     assert code == 0 and data["priority"] == "high"
     assert fake.all()[0]["priority"] == "high", "clarify 之后 Reminder 里也要带 high"
 
+
+
+# ---------------------------------------------------------------- 周期（repeat）
+
+def test_add_repeat_lands_in_store_and_payload(capsys, db, fake):
+    """「每 5 天 拼多多领券」：载荷有 repeat、Reminder 里也有、due 是今天 +5。"""
+    code, data = run(capsys, ["add", "每 5 天 拼多多领券"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["repeat"] == "every 5 days"
+    assert data["title"] == "拼多多领券"
+    assert data["due"] == "2026-11-28"
+    item = fake.all()[0]
+    assert item["title"] == "拼多多领券" and item["repeat"] == "every 5 days"
+
+
+def test_add_one_off_task_has_no_repeat(capsys, db, fake):
+    """一次性任务：载荷 repeat 为 None，Reminder 里也不许带周期。"""
+    _, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    assert data["repeat"] is None
+    assert fake.all()[0]["repeat"] == ""
+
+
+def test_add_repeat_keeps_alarm_like_a_normal_task(capsys, db, fake):
+    """有周期的任务跟普通任务一样：有时刻就到点响，周期不吞闹钟。"""
+    _, data = run(capsys, ["add", "15:00 每 5 天 领券"], db=db, store=fake)
+    item = fake.all()[0]
+    assert data["repeat"] == "every 5 days"
+    assert data["at"] == "15:00"
+    assert item["alarmDate"] == "2026-11-28 15:00"
+
+
+def test_human_receipt_shows_cycle(capsys, db, fake):
+    """--human 回执也带「（每 5 天）」，秘书转述时不用再查 JSON。"""
+    code, text = run_text(capsys, ["--human", "add", "每 5 天 拼多多领券"], db=db, store=fake)
+    assert code == 0
+    assert "拼多多领券（每 5 天）" in text
+
+
+def test_view_shows_repeat_marker(capsys, db, fake):
+    """gtd view 里能看到周期标记（标题后括注）。"""
+    run(capsys, ["add", "每 5 天 拼多多领券"], db=db, store=fake)
+    code, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert code == 0
+    assert "拼多多领券（每 5 天）" in text

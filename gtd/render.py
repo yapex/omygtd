@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Protocol
 
 from . import priority as prio
+from . import repeat as rep
 
 WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 CHROME_CANDIDATES = (
@@ -722,6 +723,7 @@ class Entry:
     all_day: bool = False             # Reminder 里的全天条目（at 必为 None）
     alarm: time | None = None         # 全天的闹钟时刻（「12:00 响」），仅用于回显
     priority: str = prio.PRIORITY_NONE   # none/low/medium/high（显示成 ! / !! / !!!）
+    repeat: str | None = None         # daily/weekly/…/every N days（标题后印「（每 5 天）」）
 
 
 def _future(entry: Entry, today: date) -> bool:
@@ -796,9 +798,11 @@ def _next_when(entry: Entry) -> str:
 
 
 def _shown_title(entry: Entry) -> str:
-    """图上/表上的标题：有优先级就在前面加感叹号（high !!!、medium !!、low !）。"""
+    """图上/表上的标题：优先级感叹号在前、周期括注在后（high !!!、``（每 5 天）``）。"""
     mark = prio.mark(entry.priority)
-    return f"{mark} {entry.title}" if mark else entry.title
+    title = f"{mark} {entry.title}" if mark else entry.title
+    cycle = rep.label(entry.repeat)
+    return f"{title}（{cycle}）" if cycle else title
 
 
 def _next_row(entry: Entry) -> str:
@@ -1025,7 +1029,8 @@ def render_today_markdown(entries: list[Entry], *, now: datetime) -> str:
 def _view_item(entry: Entry, when: str) -> dict:
     return {"number": entry.number, "when": when, "title": entry.title,
             "list": entry.list_name, "overdue_days": entry.overdue_days,
-            "priority": prio.normalize(entry.priority)}
+            "priority": prio.normalize(entry.priority),
+            "repeat": rep.normalize(entry.repeat)}
 
 
 def render_today_json(entries: list[Entry], *, now: datetime) -> str:

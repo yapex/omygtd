@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from . import priority as prio
+from . import repeat as rep
 
 LIST_DEFAULT = "GTD"
 LIST_WAITING = "Waiting"
@@ -87,6 +88,17 @@ _STAR_AFTER_BLOCK = {"重要": ("性",), "着急": ("忙",), "急": ("诊", "救
 _STAR_BEFORE_BLOCK = {"重要": ("不", "没", "非", "无"), "着急": ("不", "别", "没"),
                       "急": ("不", "别", "没")}
 
+# ---- 重复（写进 Reminder 原生 recurrenceRule，词要从标题里剥掉）
+# 「每周五」「每星期五」是星期几，不是周期 → 后面紧跟星期几就不算重复。
+_REPEAT = re.compile(
+    r"(?P<biweek>每\s*(?:两|二)\s*周|隔\s*周)"
+    r"|(?P<every>每\s*(?P<num>\d{1,2}|[一二两三四五六七八九十]{1,2})\s*"
+    r"(?P<unit>个?\s*[天周月年]))"
+    r"|(?P<named>每\s*个\s*月|每\s*天|天\s*天|每\s*星\s*期(?![一二三四五六日天])"
+    r"|每\s*周(?![一二三四五六日天])|每\s*月|每\s*年)"
+)
+_REPEAT_UNITS = {"天": "days", "周": "weeks", "个月": "months", "月": "months", "年": "years"}
+
 
 @dataclass(frozen=True)
 class Parsed:
@@ -98,6 +110,7 @@ class Parsed:
     list: str = LIST_DEFAULT            # GTD / Waiting
     slot: str | None = None             # 时段标记 am / pm（due 全天 + 闹钟到点响）
     priority: str = prio.PRIORITY_NONE  # none/low/medium/high（说「重要/急」时置档）
+    repeat: str | None = None           # daily/weekly/biweekly/…/every N days（Reminder 原生）
 
     @property
     def all_day(self) -> bool:
@@ -448,6 +461,53 @@ def _stars(text: str) -> tuple[str, list[tuple[int, int]]]:
     return level, spans
 
 
+# ---------------------------------------------------------------- 重复词
+_REPEAT_NAMED = {"每天": "daily", "天天": "daily", "每周": "weekly", "每星期": "weekly",
+                 "每月": "monthly", "每个月": "monthly", "每年": "yearly"}
+
+
+def _repeat_named(raw: str) -> str | None:
+    """「每天/天天/每周/每星期/每月/每年」→ 写法；认不出给 None。"""
+    return _REPEAT_NAMED.get(re.sub(r"\s+", "", raw))
+
+
+def _repeat_value(match: re.Match) -> str | None:
+    """一条重复说法 → 写法（``every 5 days`` 之类）；数字认不出给 None。"""
+    if match.group("biweek"):
+        return rep.BIWEEKLY
+    if match.group("every"):
+        count = _cn_number(match.group("num"))
+        unit = _REPEAT_UNITS.get(re.sub(r"\s+", "", match.group("unit") or ""))
+        if not count or count <= 0 or unit is None:
+            return None
+        return f"every {count} {unit}"
+    return _repeat_named(match.group("named") or "")
+
+
+def _clause_edge(text: str, start: int, end: int) -> bool:
+    """至少一边是小句边界（句首/句尾/标点/空白）→ 这个词可以剥。"""
+    before, after = text[start - 1:start], text[end:end + 1]
+    return (start == 0 or before in _PUNCT or before.isspace()
+            or end == len(text) or after in _PUNCT or after.isspace())
+
+
+def _repeats(text: str) -> tuple[str | None, list[tuple[int, int]]]:
+    """全句的重复说法 → (写法, 要剥掉的区间)；多个取最后一个（与日期同口径）。
+
+    只有落在小句边上的才剥：句首「每 5 天 拼多多领券」、句尾「领券 每 5 天」
+    都剥，正文里的「优惠券每 5 天刷新一次」保留原句（剥掉变病句）。
+    """
+    value, spans = None, []
+    for match in _REPEAT.finditer(text):
+        found = _repeat_value(match)
+        if found is None:
+            continue
+        value = found
+        if _clause_edge(text, match.start(), match.end()):
+            spans.append((match.start(), match.end()))
+    return value, spans
+
+
 def parse(text: str, *, now: datetime) -> Parsed:
     """把一句中文解析成 Reminder 需要的字段；解析不出来不算错。"""
     hits = _scan(text)
@@ -457,7 +517,12 @@ def parse(text: str, *, now: datetime) -> Parsed:
     at = _resolve_at(cut)
     spans = [(hit.start, hit.end) for hit in cut] + extra_spans
     level, stars = _stars(text)
-    title = _cut_title(text, spans + stars) or _cut_title(text, spans)  # 剥完不许空
+    cycle, cycle_spans = _repeats(text)
+    if cycle and due is None:               # 只说了周期没说哪天 → 往后推一轮
+        due = rep.next_due(cycle, now.date())
+    # 剥完不许空：先连重复词一起剥，空了再退回只剥时间词/原句
+    title = (_cut_title(text, spans + stars + cycle_spans)
+             or _cut_title(text, spans + stars) or _cut_title(text, spans))
     return Parsed(
         title=title,
         due=due,
@@ -467,4 +532,5 @@ def parse(text: str, *, now: datetime) -> Parsed:
         matched=_echo(text, hits),
         list=list_name,
         priority=level,
+        repeat=cycle,
     )

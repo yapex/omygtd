@@ -16,7 +16,7 @@ import pytest
 
 from gtd.reminders import (FORBIDDEN_IN_TESTS, TEST_LIST, FakeStore,
                            ReminderStore, RemindctlAdapter, _guard_list,
-                           _local_stamp, _resolve_exe, schedule)
+                           _local_stamp, _localize, _resolve_exe, schedule)
 
 REMINDCTL = _resolve_exe("remindctl") or "remindctl"
 OTHER_LIST = "GTD_TEST_B"          # 也不碰真实列表，只是第二个测试列表
@@ -336,3 +336,71 @@ def test_read_path_all_day_with_alarm_keeps_local_alarm(monkeypatch):
     assert item["all_day"] is True
     assert item["dueDate"] == "2026-11-24"            # 本地日期，不退一天
     assert item["alarmDate"] == "2026-11-24 12:00"    # 04:00Z = 本地 12:00
+
+
+# ---------- 周期（t_82fc1c49：真机重复语义实测在卡片报告里） ----------
+
+def test_adapter_passes_repeat_flag(monkeypatch):
+    """有周期就传 ``--repeat``，值是 remindctl 认的写法（不是中文）。"""
+    args = _add_args(monkeypatch, repeat="every 5 days")
+    assert args[args.index("--repeat") + 1] == "every 5 days"
+
+
+def test_adapter_without_repeat_sends_no_flag(monkeypatch):
+    """一次性任务绝不带 ``--repeat``（别传到空串上）。"""
+    args = _add_args(monkeypatch)
+    assert "--repeat" not in args
+    assert "--repeat" not in _add_args(monkeypatch, repeat="")
+
+
+def test_adapter_biweekly_keeps_remindctl_spelling(monkeypatch):
+    args = _add_args(monkeypatch, repeat="biweekly")
+    assert args[args.index("--repeat") + 1] == "biweekly"
+
+
+@pytest.mark.parametrize("rule,expected", [
+    ({"frequency": "daily", "interval": 5}, "every 5 days"),
+    ({"frequency": "weekly", "interval": 2}, "biweekly"),
+    ({"frequency": "weekly", "interval": 1}, "weekly"),
+    ({"frequency": "weekly", "interval": 3}, "every 3 weeks"),
+    ({"frequency": "monthly", "interval": 1}, "monthly"),
+    ({"frequency": "monthly", "interval": 2}, "every 2 months"),
+    ({"frequency": "yearly", "interval": 1}, "yearly"),
+])
+def test_localize_turns_eventkit_rule_into_spelling(rule, expected):
+    """读侧：EventKit 的 recurrenceRule 折回写法（真机实测形状：daily/5、weekly/2）。"""
+    item = _localize(_scho_record(recurrenceRule=rule))
+    assert item["repeat"] == expected
+
+
+def test_localize_without_rule_has_no_repeat():
+    """没有 recurrenceRule 的一次性提醒：repeat 归一成 None，不是空串。"""
+    assert _localize(_scho_record())["repeat"] is None
+
+
+def test_fake_store_keeps_repeat_on_item():
+    fake = FakeStore()
+    fake.add("拼多多领券", NOW, TEST_LIST, repeat="every 5 days")
+    assert fake.all()[0]["repeat"] == "every 5 days"
+
+
+def test_adapter_complete_treats_recurring_roll_as_success(monkeypatch):
+    """真机实测：周期任务完成后返回的是同 id、未完成、due 已 +N 的那条 → 算成功。
+
+    不加这条判断，`gtd done` 会对周期任务报「Reminder 完成失败」，而 Reminder 里
+    其实已经滚好下一轮了（本卡真机验出来的坑）。
+    """
+    adapter = RemindctlAdapter()
+    rolled = {"id": "UUID-1", "isCompleted": False,
+              "dueDate": "2026-12-03T01:00:00Z",
+              "recurrenceRule": {"frequency": "daily", "interval": 5}}
+    monkeypatch.setattr(adapter, "_run", lambda args: _Proc(json.dumps([rolled])))
+    assert adapter.complete("UUID-1") is True
+
+
+def test_adapter_complete_still_fails_when_untouched(monkeypatch):
+    """同 id 但既没完成、又没周期规则 → 仍然算失败（不许把没动过的当成功）。"""
+    adapter = RemindctlAdapter()
+    untouched = {"id": "UUID-1", "isCompleted": False}
+    monkeypatch.setattr(adapter, "_run", lambda args: _Proc(json.dumps([untouched])))
+    assert adapter.complete("UUID-1") is False

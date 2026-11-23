@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS mirror (
   list_name   TEXT NOT NULL,
   due_at      TEXT,
   completed   INTEGER NOT NULL DEFAULT 0,
+  priority    TEXT NOT NULL DEFAULT 'none',  -- 与 Reminder 同步的四档，省得回头再读一遍
   synced_at   TEXT NOT NULL
 );
 
@@ -77,7 +78,8 @@ CREATE TABLE IF NOT EXISTS board_index (
 );
 """
 
-MIRROR_COLS = ("reminder_id", "title", "list_name", "due_at", "completed", "synced_at")
+MIRROR_COLS = ("reminder_id", "title", "list_name", "due_at", "completed", "priority",
+               "synced_at")
 
 # 建表后校验列：旧库（v1）的 daily_seq 是 day/seq/task_id，撞名但不兼容，
 # 不能靠 CREATE TABLE IF NOT EXISTS 静默留着——直接报错让人先迁移。
@@ -94,6 +96,9 @@ TABLE_COLUMNS = {
 MIGRATIONS = {
     "inbox": {
         "priority": "ALTER TABLE inbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'none'",
+    },
+    "mirror": {
+        "priority": "ALTER TABLE mirror ADD COLUMN priority TEXT NOT NULL DEFAULT 'none'",
     },
 }
 
@@ -314,7 +319,7 @@ class Mirror(_LocalTable):
             conn.execute("DELETE FROM mirror")
             conn.executemany(
                 "INSERT INTO mirror (reminder_id, title, list_name, due_at, "
-                "completed, synced_at) VALUES (?, ?, ?, ?, ?, ?)", params)
+                "completed, priority, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?)", params)
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -328,14 +333,23 @@ class Mirror(_LocalTable):
             data["reminder_id"], data["title"], data["list_name"],
             data.get("due_at"),
             int(data.get("completed") or 0),
+            normalize(data.get("priority")),
             data.get("synced_at") or _iso(_now(now)),
         )
 
     def all(self) -> list[dict]:
         rows = self._db().execute(
-            "SELECT reminder_id, title, list_name, due_at, completed, synced_at "
+            "SELECT reminder_id, title, list_name, due_at, completed, priority, synced_at "
             "FROM mirror ORDER BY reminder_id").fetchall()
         return [dict(row) for row in rows]
+
+    def set_priority(self, reminder_id: str, value, *, now=None) -> bool:
+        """改镜像里那一条的档位（Reminder 已改成功后同步，别让本地副本落后）。"""
+        conn = self._db()
+        cur = conn.execute(
+            "UPDATE mirror SET priority=?, synced_at=? WHERE reminder_id=?",
+            (normalize(value), _iso(_now(now)), str(reminder_id)))
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------- board_index

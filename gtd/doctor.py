@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from . import priority as prio
 from .inbox import DEFAULT_DB, PROJECT_ROOT, Inbox, Mirror
 from .reminders import DEFAULT_LISTS
 
@@ -114,6 +115,7 @@ def _mirror_row(item: dict) -> dict:
         "list_name": str(item.get("listName") or ""),
         "due_at": item.get("dueDate") or None,
         "completed": int(bool(item.get("isCompleted"))),
+        "priority": prio.normalize(item.get("priority")),
         "synced_at": None,          # 让 replace_all 用注入的 now 盖章
     }
 

@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from . import __version__, doctor, parser as nlp, priority as prio, render
+from . import __version__, doctor, parser as nlp, priority as prio, repeat as rep, render
 from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
 from .reminders import RemindctlAdapter, ReminderStore
 
@@ -219,7 +219,7 @@ def cmd_add(ctx: Context, args) -> Result:
                                 advance_minutes=_advance(parsed),
                                 note=args.note,
                                 all_day=parsed.all_day, slot=parsed.slot,
-                                priority=level)
+                                priority=level, repeat=parsed.repeat)
     if not reminder_id:
         return _park(ctx, parsed, args.note, due_at=due_at, level=level,
                      error="Reminder 写不进去，已留在收件箱")
@@ -235,6 +235,7 @@ def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None
             "at": _hhmm(due_at) if parsed.at is not None else None,
             "all_day": parsed.all_day, "slot": parsed.slot,
             "priority": prio.normalize(level or parsed.priority),
+            "repeat": parsed.repeat,
             "reminder_id": reminder_id, "matched": parsed.matched,
             "source": "reminder"}
 
@@ -250,6 +251,7 @@ def _park(ctx: Context, parsed, note, error: str | None = None,
                "at": _hhmm(due_at) if due_at and parsed.at is not None else None,
                "all_day": parsed.all_day, "slot": parsed.slot,
                "priority": level,
+               "repeat": parsed.repeat,
                "inbox_id": inbox_id, "matched": parsed.matched}
     if error:
         payload["error"] = error
@@ -292,7 +294,7 @@ def cmd_clarify(ctx: Context, args) -> Result:
                                 advance_minutes=_advance(parsed),
                                 note=row["note"],
                                 all_day=parsed.all_day, slot=parsed.slot,
-                                priority=level)
+                                priority=level, repeat=parsed.repeat)
     if not reminder_id:
         return Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
                        "inbox_id": row["id"]}, code=EXIT_FAIL)
@@ -458,6 +460,7 @@ def _reminder_entry(name: str, item: dict, today: date):
         overdue_days=max(0, (today - due.date()).days),
         due=due.date(),
         priority=prio.normalize(item.get("priority")),
+        repeat=item.get("repeat") or None,
         ref=f"reminder:{item.get('id')}")
 
 
@@ -488,6 +491,7 @@ def _mirror_row(name: str, item: dict) -> dict:
             "list_name": name,
             "due_at": item.get("dueDate") or None,
             "completed": int(bool(item.get("isCompleted"))),
+            "priority": prio.normalize(item.get("priority")),
             "synced_at": None}       # 让 replace_all 用注入的 now 盖章
 
 
@@ -503,10 +507,10 @@ def _inbox_entries(ctx: Context) -> list:
 # ---------------------------------------------------------------- priority
 
 def cmd_priority(ctx: Context, args) -> Result:
-    """改收件箱条目的优先级：词汇与 remindctl 一致（none / low / medium / high）。
+    """改图上任何位置那一条的优先级：词汇与 remindctl 一致（none / low / medium / high）。
 
-    只认收件箱——今天区和接下来区按日期排，优先级不影响它们的顺序；要改 Reminder
-    里那条的优先级，就在 Reminders.app 里改（或 clarify 时带上去）。
+    号是**图上号**（``board_index``），收件箱念头与今天区 / 接下来区的任务一视同仁——
+    老板看的是整张图，他说「6 号 high」时 6 号可能在哪一区都正常。
     """
     level = str(args.level).strip().lower()
     if level not in prio.PRIORITIES:
@@ -522,20 +526,70 @@ def cmd_priority(ctx: Context, args) -> Result:
 
 
 def _priority_one(ctx: Context, number: int, level: str) -> dict:
-    """按图上的号改一条收件箱念头；号不对 / 不是收件箱条目都返回 ok:False。"""
+    """按图上的号改一条的档位；号不对 / 那条不在了都返回 ok:False。"""
     ref, problem = _board_ref(ctx, number)
     if problem or ref is None:
         return {"ok": False, "number": number,
                 "error": problem or f"今天没有 {number} 号"}
     kind, _, target = ref.partition(":")
-    if kind != INBOX_LIST_LABEL:
-        return {"ok": False, "number": number, "ref": ref,
-                "error": f"{number} 号是 Reminder 里的任务，只有收件箱条目能设优先级"}
+    if kind == INBOX_LIST_LABEL:
+        return _set_inbox_priority(ctx, number, ref, target, level)
+    if kind == "reminder":
+        return _set_reminder_priority(ctx, number, ref, target, level)
+    return {"ok": False, "number": number, "ref": ref, "error": f"不认识的引用 {ref}"}
+
+
+def _set_inbox_priority(ctx: Context, number: int, ref: str, target: str, level: str) -> dict:
+    """收件箱念头：只改本地那一行（念头还没进 Reminder）。"""
     if not ctx.inbox.set_priority(int(target), level, now=ctx.now):
         return {"ok": False, "number": number, "ref": ref,
                 "error": "这条念头已经迁出收件箱了（看图上的新号）"}
     return {"ok": True, "number": number, "ref": ref, "priority": level,
             "mark": prio.mark(level), "source": INBOX_LIST_LABEL}
+
+
+def _set_reminder_priority(ctx: Context, number: int, ref: str, reminder_id: str,
+                           level: str) -> dict:
+    """今天区 / 接下来区的任务：改 Reminder 里那条，成功后同步本地镜像。
+
+    已经是这个档位就原样返回 ``unchanged: true``——重复设同一档不该报错。
+    """
+    item = _reminder_item(ctx, reminder_id)
+    if item is None:
+        return {"ok": False, "number": number, "ref": ref,
+                "error": f"{number} 号已经不在 Reminder 里了，重新看图"}
+    if item.get("isCompleted"):
+        return {"ok": False, "number": number, "ref": ref,
+                "error": f"{number} 号已经完成了，重新看图"}
+    previous = prio.normalize(item.get("priority"))
+    if previous == level:
+        return {"ok": True, "number": number, "ref": ref, "priority": level,
+                "mark": prio.mark(level), "source": "reminder",
+                "previous": previous, "unchanged": True}
+    if not ctx.store.set_priority(reminder_id, level):
+        return {"ok": False, "number": number, "ref": ref,
+                "error": f"{number} 号的优先级没改成（Reminder 写失败）"}
+    result = {"ok": True, "number": number, "ref": ref, "priority": level,
+              "mark": prio.mark(level), "source": "reminder", "previous": previous}
+    warnings = _sync_mirror_priority(ctx, reminder_id, level)
+    return {**result, "warnings": warnings} if warnings else result
+
+
+def _reminder_item(ctx: Context, reminder_id: str) -> dict | None:
+    """按 id 找一条 Reminder（手机上完成 / 删掉的都会找不着）。"""
+    for item in ctx.store.all():
+        if str(item.get("id")) == reminder_id:
+            return item
+    return None
+
+
+def _sync_mirror_priority(ctx: Context, reminder_id: str, level: str) -> list[str]:
+    """镜像跟着改；镜像只是备份，失败进 warnings、不拖垮命令。"""
+    try:
+        Mirror(ctx.inbox.db_path).set_priority(reminder_id, level, now=ctx.now)
+    except Exception as exc:      # noqa: BLE001 —— 镜像落后只是备份旧了
+        return [f"镜像同步失败：{exc}"]
+    return []
 
 
 # ---------------------------------------------------------------- done
@@ -636,7 +690,8 @@ def _human(command: str, payload: dict) -> str:
     if not payload.get("ok", True):
         return f"✗ {payload.get('error') or '失败'}"
     if command in ("add", "clarify"):
-        return f"✓ #{payload['seq']} {payload.get('title') or ''}{_mark(payload)}{_when(payload)}"
+        return (f"✓ #{payload['seq']} {payload.get('title') or ''}{_mark(payload)}"
+                f"{_cycle(payload)}{_when(payload)}")
     if command == "priority":
         return _human_priority(payload)
     if command == "inbox":
@@ -656,11 +711,20 @@ def _mark(payload: dict) -> str:
     return f" {mark}" if mark else ""
 
 
+def _cycle(payload: dict) -> str:
+    """回执里的周期：有重复才印（与视图同一个词，如「（每 5 天）」）。"""
+    text = rep.label(payload.get("repeat"))
+    return f"（{text}）" if text else ""
+
+
 def _human_priority(payload: dict) -> str:
     if not payload.get("ok"):
         return f"✗ {payload.get('error') or '失败'}"
     mark = payload.get("mark") or "（无标记）"
-    return f"✓ #{payload['number']} → {payload['priority']} {mark}"
+    head = (f"✓ #{payload['number']} → {payload['priority']} {mark}"
+            + ("（本来就是这档）" if payload.get("unchanged") else ""))
+    warnings = payload.get("warnings") or []
+    return "\n".join([head, *(f"· {item}" for item in warnings)])
 
 
 def _when(payload: dict) -> str:
@@ -756,8 +820,8 @@ def _clarify(sub) -> None:
 
 
 def _priority(sub) -> None:
-    p = sub.add_parser("priority", help="设收件箱条目的优先级（词汇与 remindctl 一致）")
-    p.add_argument("number", metavar="N", help="view / inbox 上的号")
+    p = sub.add_parser("priority", help="设图上任何一条的优先级（词汇与 remindctl 一致）")
+    p.add_argument("number", metavar="N", help="view / board 上的号（收件箱、今天、接下来都认）")
     p.add_argument("level", metavar="LEVEL", help="none | low | medium | high")
 
 
