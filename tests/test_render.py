@@ -137,7 +137,7 @@ def test_numbers_print_as_given_and_are_not_renumbered():
 def test_top_bar_counts_match_entries():
     page, *_ = build_today_html(FIVE, now=NOW)
     text = visible(page)
-    assert "今天 5 件" in text
+    assert "今天 3 件" in text, "「今天」只数今日区那三行任务，收件箱行不算"
     assert "逾期 1 件" in text
     assert "收件箱 2 条" in text
 
@@ -277,7 +277,7 @@ def test_upcoming_sits_between_today_rows_and_inbox():
          entry("买鸡蛋", number=3, kind="inbox")],
         now=NOW)
     assert page.index('class="rows"') < page.index("接下来") < page.index('class="lower"')
-    assert "今天 2 件" in visible(page), "inbox 仍计入「今天」那一格（口径未改）"
+    assert "今天 1 件" in visible(page), "收件箱行不许再混进「今天」那一格（会重复计数）"
 
 
 # ---------- 11. board_order：图上从上到下那一份（命令层照它挑号） ----------
@@ -440,11 +440,28 @@ def test_json_view_is_structured_with_numbers():
     text = render_today_json([entry("甲", number=1, at=time(22, 30)),
                               entry("想到一个点子", number=2, kind="inbox")], now=NOW)
     data = json.loads(text)
-    # 「今天」与图上顶栏同一口径：收件箱行也算在里面，所以是 2 件
-    assert data["summary"] == {"today": 2, "overdue": 0, "inbox": 1}
+    # 「今天」= 今日区行数：收件箱单独一格，不混进来（否则顶栏比数组多 1）
+    assert data["summary"] == {"today": 1, "overdue": 0, "inbox": 1}
+    assert len(data["today"]) == data["summary"]["today"]
     assert [item["number"] for item in data["today"]] == [1]
     assert data["today"][0]["when"] == "22:30"
     assert [item["title"] for item in data["inbox"]] == ["想到一个点子"]
+
+
+def test_today_count_equals_visible_today_rows():
+    """锁死口径：图上「今天 N 件」== 今日区行数，文字视图同数（收件箱/未来都不许混入）。"""
+    entries = [entry("今天的甲", number=1, at=time(9, 0)),
+               entry("昨天的乙", number=2, at=time(8, 0), overdue_days=1),
+               later("周五的丙", number=3, days=4, at=time(16, 0)),
+               entry("买鸡蛋", number=4, kind="inbox"),
+               entry("给车做保养", number=5, kind="inbox")]
+    page, *_ = build_today_html(entries, now=NOW)
+    assert "今天 2 件" in visible(page)
+    rows = page.split('class="rows"', 1)[1].split('class="next"', 1)[0]
+    assert re.findall(r'<div class="seq">(\d+)</div>', rows) == ["2", "1"], \
+        "今日区按时刻升序排（08:00 的逾期条在前），号是 board_index 给的、不参与排序"
+    data = json.loads(render_today_json(entries, now=NOW))
+    assert data["summary"]["today"] == len(data["today"]) == 2
 
 
 def test_view_formats_are_md_and_json():

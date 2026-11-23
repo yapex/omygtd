@@ -709,8 +709,8 @@ def test_view_json_format_returns_structured_data(capsys, db, fake):
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
     code, text = run_text(capsys, ["view", "--format", "json"], db=db, store=fake)
     data = json.loads(text)                      # 结构化，不是 Markdown
-    # 「今天」与图上顶栏同一口径（收件箱行也算在「今天」里）→ 2 件
-    assert code == 0 and data["summary"] == {"today": 2, "overdue": 0, "inbox": 1}
+    # 「今天」= 今日区行数：收件箱行不算在「今天」里（它自己有一格），所以是 1 件
+    assert code == 0 and data["summary"] == {"today": 1, "overdue": 0, "inbox": 1}
     assert [item["number"] for item in data["today"]] == [1]
     assert data["today"][0]["when"] == "12:00"
     assert [item["title"] for item in data["inbox"]] == ["想到一个点子"]

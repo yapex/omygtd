@@ -726,6 +726,17 @@ def _future(entry: Entry, today: date) -> bool:
     return entry.kind != "inbox" and entry.due is not None and entry.due > today
 
 
+def _today_rows(entries: list[Entry], today: date) -> list[Entry]:
+    """今日区那几行的唯一口径：今天到期（含逾期）的**任务**，不含收件箱念头。
+
+    顶栏「今天 N 件」与文字视图 ``summary.today`` 都走这里，图上今日区的行也用它切，
+    所以「今天 N 件」必然等于今日区真画出来的行数。收件箱行另有「收件箱 K 条」一格，
+    不许再重复计进「今天」——以前把它算进来，图上写 2 件、今日区只有 1 行。
+    """
+    return [entry for entry in entries
+            if entry.kind != "inbox" and not _future(entry, today)]
+
+
 def _upcoming(entry: Entry, today: date) -> bool:
     """今天之后、7 天以内（含第 7 天）的未完成条目 → 进「接下来」区。"""
     if entry.due is None or not _future(entry, today):
@@ -738,7 +749,7 @@ def _split_today(entries: list[Entry], today: date):
 
     未来的条目两边都不进——7 天内的归「接下来」，更远的不上图。
     """
-    tasks = [e for e in entries if e.kind != "inbox" and not _future(e, today)]
+    tasks = _today_rows(entries, today)
     timed = [e for e in tasks if e.at is not None]
     timed.sort(key=lambda e: e.at or time(0, 0))
     untimed = [e for e in tasks if e.at is None]
@@ -800,9 +811,9 @@ def _next_block(shown: list[Entry], total: int):
 
 
 def _top_bar_html(entries: list[Entry], today: date) -> str:
-    """顶栏三格：今天总件数 / 逾期件数 / 收件箱条数。接下来的不计入「今天」。"""
+    """顶栏三格：今日区行数 / 其中逾期的 / 收件箱条数。接下来的、收件箱都不计入「今天」。"""
     sep = '<span class="sep">·</span>'
-    todays = [e for e in entries if not _future(e, today)]
+    todays = _today_rows(entries, today)
     inbox = sum(1 for e in entries if e.kind == "inbox")
     overdue = sum(1 for e in todays if e.overdue_days > 0)
     return (f'<div class="top">今天 <b>{len(todays)}</b> 件{sep}'
@@ -932,10 +943,11 @@ MD_INBOX_LABEL = "**收件箱**"
 def _counts(entries: list[Entry], today: date) -> dict[str, int]:
     """顶栏三个数，与图上「今天 N 件 · 逾期 M 件 · 收件箱 K 条」**同一口径**。
 
-    注意「今天」按图上的算法包含收件箱行（图上顶栏就是这么数的），别在这里
-    自作聪明改成只数任务——两个视图的数必须对得上。
+    三个数都出自 ``_today_rows`` / ``kind``：``today`` 恒等于 ``today`` 数组长度
+    （今日区真画出来的行数），收件箱另有自己一格、不重复计入。图与文字都走这一处，
+    所以「今天 N 件」永远能一条条数出来。
     """
-    todays = [entry for entry in entries if not _future(entry, today)]
+    todays = _today_rows(entries, today)
     return {"today": len(todays),
             "overdue": sum(1 for entry in todays if entry.overdue_days > 0),
             "inbox": sum(1 for entry in entries if entry.kind == "inbox")}
