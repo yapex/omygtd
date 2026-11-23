@@ -334,8 +334,9 @@ def test_board_counts_match_data(capsys, db, fake, tmp_path, monkeypatch):
     assert seen["entries"][-1].kind == "inbox"
 
 
-def test_board_passes_seven_day_window_to_render(capsys, db, fake, tmp_path, monkeypatch):
-    """窗口边界：7 天内（含第 7 天）的条目传给 render（进「接下来」区），第 8 天的不传。"""
+def test_board_passes_far_entries_to_render(capsys, db, fake, tmp_path, monkeypatch):
+    """窗口边界：第 7 天仍在「接下来」；第 8 天起也传给渲染层（图上折进「更远」，
+    文字视图全量列出）。2026-11-23 老板拍板：图折叠、文字全量。"""
     fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     fake.add("第七天的事", datetime(2026, 11, 30, 12, 0), TEST_LIST)
     fake.add("第八天的事", datetime(2026, 12, 1, 12, 0), TEST_LIST)
@@ -350,7 +351,9 @@ def test_board_passes_seven_day_window_to_render(capsys, db, fake, tmp_path, mon
     code, data = run(capsys, ["board", "--out", str(tmp_path / "x.png")], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     titles = [entry.title for entry in seen["entries"]]
-    assert titles == ["今天交材料", "第七天的事"], titles
+    assert titles == ["今天交材料", "第七天的事", "第八天的事"], titles
+    assert seen["entries"][-1].due.isoformat() == "2026-12-01"
+    assert data["count"] == 2, "count 仍只数图上真画出来的条目（更远只折一行）"
 
 
 # ---------------------------------------------------------------- 图上号（board_index）
@@ -420,6 +423,37 @@ def test_board_numbers_only_what_is_drawn(capsys, db, fake, out_dir, monkeypatch
     assert code == 0 and data["ok"] is True
     assert data["numbers"] == [1, 2, 3, 4, 5] and data["count"] == 5
     assert len(board_rows(db)) == 5
+
+
+def test_far_entries_get_numbers_but_do_not_count_as_drawn(capsys, db, fake, out_dir,
+                                                           monkeypatch):
+    """「更远」占号（文字视图要印号、done 要能指），但不进 count、不逐条上图。"""
+    ids = [fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST),
+           fake.add("第七天的事", datetime(2026, 11, 30, 12, 0), TEST_LIST),
+           fake.add("大白年检", datetime(2027, 3, 1, 12, 0), TEST_LIST),
+           fake.add("取消Darkroom的订阅", datetime(2027, 10, 3, 21, 0), TEST_LIST)]
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    code, data = run(capsys, ["board"], db=db, store=fake)
+    assert code == 0 and data["count"] == 2, "图上只有今日 + 接下来两条"
+    assert data["numbers"] == [1, 2], "numbers 只列图上真画出来的"
+    refs = [(n, f"reminder:{rid}") for n, rid in zip(range(1, 5), ids)]
+    assert board_rows(db) == refs, "「更远」的号追加在后，文字视图靠它印号"
+    again = run(capsys, ["board"], db=db, store=fake)[1]
+    assert again["numbers"] == [1, 2] and board_rows(db)[-2:] == refs[-2:], \
+        "当天幂等：更远的号也不许重排"
+
+
+def test_view_markdown_lists_far_entries_in_full(capsys, db, fake, monkeypatch):
+    """`gtd view` 全量：2027 的年度任务出现在「更远」表里，号就是 board 给的号。"""
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("大白年检", datetime(2027, 3, 1, 12, 0), TEST_LIST)
+    fake.add("取消Darkroom的订阅", datetime(2027, 10, 3, 21, 0), TEST_LIST)
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    code, text = run_text(capsys, ["view"], db=db, store=fake)
+    assert code == 0
+    assert "**更远**" in text and "| # | 日期 | 标题 | 列表 |" in text
+    assert "| 2 | 2027-03-01 12:00 | 大白年检 | GTD_TEST |" in text
+    assert "| 3 | 2027-10-03 21:00 | 取消Darkroom的订阅 | GTD_TEST |" in text
 
 
 # ---------------------------------------------------------------- board → mirror

@@ -694,6 +694,10 @@ T_TAG_W = 130
 T_TITLE_W = T_WIDTH - T_PAD_X * 2 - T_SEQ_W - T_AT_W - T_LIST_W - T_TAG_W
 NEXT_LIMIT = 5                   # 「接下来」区最多 5 条，超出折一行「还有 N 条」
 NEXT_DAYS = 7                    # 未来 7 天以内（含第 7 天）才进「接下来」
+FAR_LABEL = "更远"               # 超过 NEXT_DAYS 的：图上只折一行，文字视图全量列
+# 分区顺序**只此一处**（近 → 远）：图与文字视图都照它排，别再各写一遍。
+# 今天 → 接下来（7 天内）→ 更远（7 天外）→ 收件箱（待澄清）。
+SECTION_ORDER = ("today", "next", "far", "inbox")
 T_WHEN_W = T_SEQ_W + T_AT_W      # 200：「号 + 周五 15:30」正好占序号 + 时刻两列
 T_NEXT_LABEL_H = 40
 T_MORE_H = 34
@@ -770,10 +774,30 @@ def _next_key(entry: Entry):
     return (entry.due, 0 if entry.at is not None else 1, entry.at or time(0, 0))
 
 
-def _next_pick(entries: list[Entry], today: date):
-    """「接下来」区的内容：(前 NEXT_LIMIT 条, 总条数)。"""
-    items = sorted((e for e in entries if _upcoming(e, today)), key=_next_key)
-    return items[:NEXT_LIMIT], len(items)
+def _upcoming_sorted(entries: list[Entry], today: date) -> list[Entry]:
+    """「接下来」区的全部候选（未来 7 天内），按日期升序。"""
+    return sorted((e for e in entries if _upcoming(e, today)), key=_next_key)
+
+
+def _far_entry(entry: Entry, today: date) -> bool:
+    """今天之后、超过 NEXT_DAYS 天的未完成任务 → 归「更远」区。"""
+    return (entry.kind != "inbox" and entry.due is not None
+            and (entry.due - today).days > NEXT_DAYS)
+
+
+def _far_sorted(entries: list[Entry], today: date) -> list[Entry]:
+    """「更远」区的全部条目（同样按日期升序：最近那条在最前，图上折行取它）。"""
+    return sorted((e for e in entries if _far_entry(e, today)), key=_next_key)
+
+
+def upcoming_entries(entries: list[Entry], *, now: datetime) -> list[Entry]:
+    """「接下来」全量（图上只画前 NEXT_LIMIT 条，文字视图全量印）。"""
+    return _upcoming_sorted(entries, now.date())
+
+
+def far_entries(entries: list[Entry], *, now: datetime) -> list[Entry]:
+    """「更远」全量（图上只折一行，文字视图全量印）。"""
+    return _far_sorted(entries, now.date())
 
 
 def _when_text(entry: Entry) -> str:
@@ -814,17 +838,37 @@ def _next_row(entry: Entry) -> str:
             '</div>')
 
 
-def _next_block(shown: list[Entry], total: int):
-    """「接下来」区；没有条目时整区不渲染（返回空串，连标题都不留）。"""
-    if not shown:
+def _next_block(upcoming: list[Entry]):
+    """「接下来」区：图上最多 NEXT_LIMIT 条，多出来只折一行；0 条整区不渲染。"""
+    if not upcoming:
         return "", 0
+    shown = upcoming[:NEXT_LIMIT]
     rows = "".join(_next_row(entry) for entry in shown)
-    extra = total - len(shown)
+    extra = len(upcoming) - len(shown)
     note = f'<div class="more">还有 {extra} 条</div>' if extra > 0 else ""
     height = T_NEXT_LABEL_H + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in shown)
     height += T_MORE_H if extra > 0 else 0
     return (f'<div class="next"><div class="label">接下来</div>{rows}{note}</div>',
             height)
+
+
+def _far_date(entry: Entry) -> str:
+    """「更远」折行里的日期：只印 ``YYYY-MM-DD``（时刻留给文字视图）。"""
+    return entry.due.strftime("%Y-%m-%d") if entry.due else ""
+
+
+def _far_block(far: list[Entry]):
+    """「更远」区：只一行「还有 N 条 · 最近：日期 标题」；0 条整区不渲染。
+
+    样式复用现有折叠行（灰字 ``.more``、无链接无按钮），所以条目再多图也不变长。
+    """
+    if not far:
+        return "", 0
+    nearest = far[0]
+    note = f"还有 {len(far)} 条 · 最近：{_far_date(nearest)} {nearest.title}"
+    return (f'<div class="far"><div class="label">{FAR_LABEL}</div>'
+            f'<div class="more">{html.escape(note)}</div></div>',
+            T_NEXT_LABEL_H + T_MORE_H)
 
 
 def _top_bar_html(entries: list[Entry], today: date) -> str:
@@ -882,15 +926,17 @@ def _title_lines(entry: Entry) -> int:
     return max(1, math.ceil(px / T_TITLE_W))
 
 
-def _today_estimate(upper: list[Entry], lower: list[Entry], next_h: int = 0) -> int:
-    """按行数估高；真实高度由 Chrome 量（见 _measure_height），这里只是兜底。"""
+def _rows_height(entries: list[Entry]) -> int:
+    """一组行的估算高度（与 ``_rows_block`` 对应）。"""
+    return sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in entries)
+
+
+def _today_estimate(heights: dict[str, int]) -> int:
+    """按各区高度估高；真实高度由 Chrome 量（见 _measure_height），这里只是兜底。"""
     height = T_PAD_TOP + T_TOP_H + T_FOOT_H + T_PAD_BOTTOM + T_SAFETY
-    if upper:
-        height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in upper)
-    if next_h:
-        height += T_GAP + next_h
-    if lower:
-        height += T_GAP + sum(T_ROW_PAD + _title_lines(e) * T_LINE_H for e in lower)
+    for name in SECTION_ORDER:
+        if heights.get(name):
+            height += T_GAP + heights[name]
     return height
 
 
@@ -904,35 +950,46 @@ def _today_document(body: str) -> str:
 
 
 def _layout(entries: list[Entry], today: date):
-    """图上分区的唯一真相：今日上区 / 接下来（前 5 条 + 总数）/ 收件箱下区。"""
+    """图上分区的唯一真相：今日上区 / 接下来全量 / 更远全量 / 收件箱下区。"""
     upper, lower = _split_today(entries, today)
-    shown, total = _next_pick(entries, today)
-    return upper, shown, total, lower
+    return (upper, _upcoming_sorted(entries, today),
+            _far_sorted(entries, today), lower)
 
 
 def board_order(entries: list[Entry], *, now: datetime) -> list[Entry]:
-    """图上从上到下的那一份顺序（今日 → 接下来 → 收件箱）。
+    """图上从上到下真画出来的那一份顺序（今日 → 接下来前 5 → 收件箱）。
 
     图上 1..N 的号就按它排；命令层拿它写「图上号 → ref」映射，`done` 靠映射反查。
+    「更远」只折一行、不逐条画，所以不在这里；它的号由命令层单独追加（见 cli）。
     """
-    upper, shown, _total, lower = _layout(entries, now.date())
-    return upper + shown + lower
+    upper, upcoming, _far, lower = _layout(entries, now.date())
+    return upper + upcoming[:NEXT_LIMIT] + lower
+
+
+def _page_sections(entries: list[Entry], now: datetime):
+    """(名字, HTML, 高度) 三段——顺序由 ``SECTION_ORDER`` 一处决定，图与文字共用。"""
+    upper, upcoming, far, lower = _layout(entries, now.date())
+    made = {
+        "today": (_rows_block("rows", upper, now), _rows_height(upper)),
+        "next": _next_block(upcoming),
+        "far": _far_block(far),
+        "inbox": (_rows_block("lower", lower, now), _rows_height(lower)),
+    }
+    return [(name, made[name][0], made[name][1]) for name in SECTION_ORDER]
 
 
 def build_today_html(entries: list[Entry], *, now: datetime) -> tuple[str, int, int]:
     """返回 (html, 宽, 高)；高是估算值，render_today 会再用 Chrome 量一次。
 
-    区块顺序：今日（含逾期）→ 接下来（未来 7 天，最多 5 条）→ 收件箱。
+    区块顺序只由 ``SECTION_ORDER`` 决定：今日（含逾期）→ 接下来 → 更远 → 收件箱。
     序号直接用 ``Entry.number``（命令层按 board_index 当天固定号给），这里不重排。
     """
-    upper, shown, total, lower = _layout(entries, now.date())
-    next_html, next_h = _next_block(shown, total)
+    sections = _page_sections(entries, now)
     body = (_top_bar_html(entries, now.date())
-            + _rows_block("rows", upper, now)
-            + next_html
-            + _rows_block("lower", lower, now)
+            + "".join(html_ for _name, html_, _h in sections)
             + f'<div class="foot">只读 · {now.strftime("%H:%M")}</div>')
-    return _today_document(body), T_WIDTH, _today_estimate(upper, lower, next_h)
+    heights = {name: height for name, _html, height in sections}
+    return _today_document(body), T_WIDTH, _today_estimate(heights)
 
 
 def render_today(entries: list[Entry], *, now: datetime, out_path: Path) -> Path:
@@ -954,6 +1011,7 @@ def render_today(entries: list[Entry], *, now: datetime, out_path: Path) -> Path
 # 区别只在最后一公里——图是 PNG，文字是 Markdown（手机能直接看）或 JSON（脚本用）。
 
 MD_NEXT_LABEL = "**接下来**"
+MD_FAR_LABEL = "**更远**"
 MD_INBOX_LABEL = "**收件箱**"
 
 
@@ -997,32 +1055,68 @@ def _md_table(head: tuple[str, ...], rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
-def _md_next_block(shown: list[Entry], total: int) -> str:
-    """「接下来」区：前 5 条上表，多出来的只报一句「还有 N 条」（与图上一致）。"""
+def _far_when(entry: Entry) -> str:
+    """更远区的日期列：``YYYY-MM-DD HH:MM``；全天条目只给日期（有闹钟给钟点）。
+
+    「更远」跨度可能是几个月到几年，光写「周五 16:00」看不出年份，所以印完整日期。
+    """
+    if entry.due is None:
+        return ""
+    stamp = entry.due.strftime("%Y-%m-%d")
+    clock = entry.at or (entry.alarm if entry.all_day else None)
+    return f"{stamp} {clock.strftime('%H:%M')}" if clock else stamp
+
+
+def _md_next_block(upcoming: list[Entry]) -> str:
+    """「接下来」区**全量**上表（老板要全量：50 条也不截断、不写「还有 N 条」）。"""
     rows = [(str(entry.number), _next_when(entry), _md_title(entry), entry.list_name)
-            for entry in shown]
-    table = _md_table(("日期时刻", "标题", "列表"), rows)
-    extra = total - len(shown)
-    return f"{table}\n\n还有 {extra} 条" if extra > 0 else table
+            for entry in upcoming]
+    return _md_table(("日期时刻", "标题", "列表"), rows)
+
+
+def _md_far_block(far: list[Entry]) -> str:
+    """「更远」区全量上表：日期升序，号照 ``board_index`` 原样印。"""
+    rows = [(str(entry.number), _far_when(entry), _md_title(entry), entry.list_name)
+            for entry in far]
+    return _md_table(("日期", "标题", "列表"), rows)
+
+
+def _md_today_block(upper: list[Entry]) -> str:
+    """今日表（含逾期）；空区返回空串。"""
+    if not upper:
+        return ""
+    rows = [(str(entry.number), _when_text(entry), _md_title(entry), entry.list_name)
+            for entry in upper]
+    return _md_table(("时刻", "标题", "列表"), rows)
+
+
+def _md_inbox_block(lower: list[Entry]) -> str:
+    """收件箱表；空区返回空串。"""
+    if not lower:
+        return ""
+    rows = [(str(entry.number), _md_title(entry)) for entry in lower]
+    return f"{MD_INBOX_LABEL}\n\n{_md_table(('标题',), rows)}"
+
+
+def _md_sections(entries: list[Entry], now: datetime) -> list[str]:
+    """各区 Markdown；顺序由 ``SECTION_ORDER`` 一处决定（与图同一份顺序）。"""
+    upper, upcoming, far, lower = _layout(entries, now.date())
+    made = {
+        "today": _md_today_block(upper),
+        "next": f"{MD_NEXT_LABEL}\n\n{_md_next_block(upcoming)}" if upcoming else "",
+        "far": f"{MD_FAR_LABEL}\n\n{_md_far_block(far)}" if far else "",
+        "inbox": _md_inbox_block(lower),
+    }
+    return [made[name] for name in SECTION_ORDER if made[name]]
 
 
 def render_today_markdown(entries: list[Entry], *, now: datetime) -> str:
-    """全库 Markdown：今天 → 接下来 → 收件箱；空区整区不渲染。
+    """全库 Markdown：今天 → 接下来 → 更远 → 收件箱；空区整区不渲染、全量不截断。
 
     编号由命令层按 ``board_index`` 填在 ``Entry.number``（与 ``board`` 出图同一套号），
     这里只印不排。逾期条目标题后带「（逾期 N 天）」，全天/上午/下午沿用 ``_when_text``。
     """
-    upper, shown, total, lower = _layout(entries, now.date())
-    blocks = [_md_summary(entries, now.date())]
-    if upper:
-        rows = [(str(entry.number), _when_text(entry), _md_title(entry), entry.list_name)
-                for entry in upper]
-        blocks.append(_md_table(("时刻", "标题", "列表"), rows))
-    if shown:
-        blocks.append(f"{MD_NEXT_LABEL}\n\n{_md_next_block(shown, total)}")
-    if lower:
-        rows = [(str(entry.number), _md_title(entry)) for entry in lower]
-        blocks.append(f"{MD_INBOX_LABEL}\n\n{_md_table(('标题',), rows)}")
+    blocks = [_md_summary(entries, now.date()), *_md_sections(entries, now)]
     return "\n\n".join(blocks) + "\n"
 
 
@@ -1034,11 +1128,13 @@ def _view_item(entry: Entry, when: str) -> dict:
 
 
 def render_today_json(entries: list[Entry], *, now: datetime) -> str:
-    """结构化文字视图：三区条目 + 每条的号/时刻/标题/列表/逾期天数。"""
-    upper, shown, total, lower = _layout(entries, now.date())
-    payload = {"summary": _counts(entries, now.date()), "next_total": total,
+    """结构化文字视图：四区条目 + 每条的号/时刻/标题/列表/逾期天数（全量，不截断）。"""
+    upper, upcoming, far, lower = _layout(entries, now.date())
+    payload = {"summary": _counts(entries, now.date()),
+               "next_total": len(upcoming), "far_total": len(far),
                "today": [_view_item(e, _when_text(e)) for e in upper],
-               "next": [_view_item(e, _next_when(e)) for e in shown],
+               "next": [_view_item(e, _next_when(e)) for e in upcoming],
+               "far": [_view_item(e, _far_when(e)) for e in far],
                "inbox": [_view_item(e, "") for e in lower]}
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1131,6 +1227,7 @@ TODAY_CSS = """  * { box-sizing: border-box; margin: 0; padding: 0; }
   .rows { margin-top: 34px; }
   .lower { margin-top: 34px; }
   .next { margin-top: 34px; }
+  .far { margin-top: 34px; }
   .label { font-size: 22px; color: #8a8078; letter-spacing: .14em; margin-bottom: 2px; }
   .when { width: 200px; flex: none; font-size: 24px; color: #6b6259; white-space: nowrap;
           font-variant-numeric: tabular-nums; }

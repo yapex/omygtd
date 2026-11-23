@@ -218,10 +218,13 @@ def test_upcoming_within_seven_days_appears_with_weekday():
         "日期前缀必须是星期几 + 时刻，号印在左边"
 
 
-def test_upcoming_beyond_seven_days_is_hidden():
+def test_upcoming_beyond_seven_days_goes_to_far_line():
+    """超过 7 天的不进「接下来」逐条画：图上只折一行「更远」（2026-11-23 改）。"""
     page, *_ = build_today_html([later("下下周才做的事", days=8, at=time(10, 0))], now=NOW)
-    assert "下下周才做的事" not in page
-    assert "接下来" not in page, "没有未来条目时整区不渲染"
+    assert '<div class="title">下下周才做的事' not in page, "不许逐条画成一行"
+    assert "接下来" not in page, "没有 7 天内的条目时整区不渲染"
+    assert "更远" in page
+    assert "还有 1 条 · 最近：2026-12-01 下下周才做的事" in visible(page)
 
 
 def test_upcoming_includes_the_seventh_day():
@@ -425,11 +428,13 @@ def test_markdown_numbers_print_as_given_and_are_not_renumbered():
     assert [row.split(" | ")[0] for row in md_rows(text)] == ["| 4", "| 9"]
 
 
-def test_markdown_next_folds_after_five_with_count():
-    rows = [later(f"第{day}天", days=day, number=day + 1, at=time(9, 0)) for day in range(1, 7)]
+def test_markdown_next_lists_everything_without_folding():
+    """老板要全量：7 条 7 天内的条目全上表，不写「还有 N 条」（2026-11-23 改）。"""
+    rows = [later(f"第{day}天", days=day, number=day + 1, at=time(9, 0)) for day in range(1, 8)]
     text = md(rows)
-    assert len(md_rows(text)) == 5
-    assert "还有 1 条" in text
+    assert len(md_rows(text)) == 7
+    assert "还有" not in text
+    assert "| 8 | 周一 09:00 | 第7天 | GTD |" in text
 
 
 def test_markdown_escapes_pipes_in_titles():
@@ -553,3 +558,94 @@ def test_json_view_item_carries_repeat():
     data = json.loads(render_today_json([entry("领券", number=1, repeat="every 5 days")],
                                         now=NOW))
     assert data["today"][0]["repeat"] == "every 5 days"
+
+
+# ---------- 14. 「更远」区（超过 7 天的年度任务，2026-11-23） ----------
+#
+# 老板拍板：图片按折叠设计（只一行「还有 N 条 · 最近：日期 标题」），文字输出全部内容。
+# 背景：一条 2027-10-03 的年度任务搬进 GTD 后视图上看不到——「接下来」只显示 7 天。
+
+def far_entry(title, *, date_, number=1, at=None, all_day=False, alarm=None,
+              priority="none"):
+    """未来很远的一条（「更远」区的候选）。"""
+    return Entry(number=number, title=title, at=at, list_name="GTD", overdue_days=0,
+                 due=date_, all_day=all_day, alarm=alarm, priority=priority)
+
+
+def test_far_section_absent_when_empty():
+    """0 条时整区不渲染：图上连「更远」两个字都不许有，文字视图连标题都不留。"""
+    page, *_ = build_today_html([entry("今天的事")], now=NOW)
+    assert "更远" not in visible(page)
+    assert 'class="far"' not in page
+    assert "**更远**" not in md([entry("今天的事")])
+
+
+def test_far_fold_line_shows_count_and_nearest():
+    """只一行「还有 N 条 · 最近：<最近那条的日期 + 标题>」，不逐条画、不带链接按钮。"""
+    page, *_ = build_today_html(
+        [far_entry("大白年检", date_=date(2027, 3, 1), number=8, all_day=True),
+         far_entry("取消Darkroom的订阅", date_=date(2027, 10, 3), number=5, at=time(21, 0))],
+        now=NOW)
+    assert '<div class="far"><div class="label">更远</div>' in page
+    assert '<div class="more">还有 2 条 · 最近：2027-03-01 大白年检</div>' in page
+    assert '<div class="title">取消Darkroom' not in page, "更远不逐条画成行"
+    assert re.search(r"\.more \{[^}]*#a89e94", page), "沿用现有折叠行的灰字样式"
+    assert "<a " not in page and "<button" not in page, "折叠行不带链接/按钮"
+
+
+def test_section_order_is_today_next_far_inbox():
+    """顺序只有一处（``SECTION_ORDER``）：近 → 远。图与文字视图必须一致。"""
+    entries = [entry("今天的事", number=1),
+               later("周五的事", number=2, days=4),
+               far_entry("年度任务", date_=date(2027, 3, 1), number=3),
+               entry("买鸡蛋", number=4, kind="inbox")]
+    page, *_ = build_today_html(entries, now=NOW)
+    assert (page.index('class="rows"') < page.index("接下来")
+            < page.index("更远") < page.index('class="lower"'))
+    text = md(entries)
+    assert text.index("**接下来**") < text.index("**更远**") < text.index("**收件箱**")
+
+
+def test_far_line_height_does_not_grow_with_count():
+    """只折一行：1 条与 30 条的估高完全一样（图不随「更远」条数变长）。"""
+    _p1, _w1, one = build_today_html([far_entry("年检", date_=date(2027, 3, 1))], now=NOW)
+    many = [far_entry(f"第{i}件", date_=date(2027, 3, 1 + i), number=i) for i in range(30)]
+    _p2, _w2, lots = build_today_html(many, now=NOW)
+    assert one == lots
+
+
+def test_far_title_is_html_escaped():
+    page, *_ = build_today_html([far_entry("<b>看</b>", date_=date(2027, 3, 1))], now=NOW)
+    assert "&lt;b&gt;看&lt;/b&gt;" in page and "<b>看</b>" not in page
+
+
+def test_markdown_far_lists_all_with_full_dates():
+    """文字视图全量：日期升序、号照 board_index、日期印全（YYYY-MM-DD [HH:MM]）。"""
+    text = md([far_entry("取消Darkroom的订阅", date_=date(2027, 10, 3), number=5,
+                         at=time(21, 0)),
+               far_entry("大白年检", date_=date(2027, 3, 1), number=8, all_day=True,
+                         alarm=time(12, 0)),
+               far_entry("老爸生日", date_=date(2027, 3, 10), number=9, all_day=True)])
+    assert "**更远**" in text
+    assert "| # | 日期 | 标题 | 列表 |" in text
+    assert md_rows(text) == [
+        "| 8 | 2027-03-01 12:00 | 大白年检 | GTD |",
+        "| 9 | 2027-03-10 | 老爸生日 | GTD |",
+        "| 5 | 2027-10-03 21:00 | 取消Darkroom的订阅 | GTD |",
+    ], md_rows(text)
+
+
+def test_markdown_far_keeps_priority_marks_and_pipes_escaped():
+    text = md([far_entry("A | B", date_=date(2027, 3, 1), number=7, priority="high")])
+    assert "| 7 | 2027-03-01 | !!! A \\| B | GTD |" in text
+
+
+def test_json_view_carries_far_items():
+    data = json.loads(render_today_json(
+        [far_entry("年检", date_=date(2027, 3, 1), number=8, all_day=True),
+         far_entry("订阅", date_=date(2027, 10, 3), number=5, at=time(21, 0))], now=NOW))
+    assert data["far_total"] == 2 and data["next_total"] == 0
+    assert [item["number"] for item in data["far"]] == [8, 5]
+    assert [item["when"] for item in data["far"]] == ["2027-03-01", "2027-10-03 21:00"]
+    assert data["summary"]["today"] == 0, "更远的不许混进「今天」那一格"
+

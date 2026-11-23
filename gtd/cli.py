@@ -510,8 +510,9 @@ class TodayView:
     """一次「看板/文字视图」的装配结果：Reminder 全量、图上条目、当天固定号。
 
     ``items`` 是 GTD/Waiting 未完成的全部条目（镜像要全量）；``entries`` 是图上/表上
-    会出现的条目（``number`` 已按 ``board_index`` 填好）；``order`` 是图上从上到下的
-    顺序（今日 → 接下来 → 收件箱），``numbers`` 是这条顺序上每条的号。
+    会出现的条目（``number`` 已按 ``board_index`` 填好）；``order`` 是图上从上到下
+    **真画出来**的顺序（今日 → 接下来 → 收件箱，「更远」只折一行不逐条画），
+    ``numbers`` 是含「更远」在内每条的号（文字视图要全量印号）。
     """
 
     items: list
@@ -528,10 +529,11 @@ def _today_view(ctx: Context) -> TodayView:
     """
     items = _open_items(ctx)                    # 出图与镜像共用这一份，不读两遍
     entries = _today_tasks(ctx, items) + _inbox_entries(ctx)
-    order = render.board_order(entries, now=ctx.now)      # 图上从上到下
-    numbers = _board_numbers(ctx, order)                 # 引用 → 当天固定的图上号
+    order = render.board_order(entries, now=ctx.now)      # 图上真画出来的顺序
+    far = render.far_entries(entries, now=ctx.now)        # 「更远」：图上折一行，文字全量
+    numbers = _board_numbers(ctx, order + far)           # 引用 → 当天固定的图上号
     numbered = [replace(entry, number=numbers.get(entry.ref, entry.number))
-                for entry in entries]     # 没上图（超过 5 条）的条目不会印出来
+                for entry in entries]     # 「更远」的也带上号：文字视图要全量印
     return TodayView(items=items, entries=numbered, order=order, numbers=numbers)
 
 
@@ -618,24 +620,26 @@ def _open_items(ctx: Context) -> list[tuple[str, dict]]:
 
 
 def _today_tasks(ctx: Context, items) -> list:
-    """今天该看的（含逾期）＋ 未来 7 天内的「接下来」；更远的不传。
+    """Reminder 未完成条目 → 渲染层条目（不按 7 天窗口丢：更远的要进「更远」区）。
 
-    未来条目也带上 ``due``：渲染层靠它把「今日」和「接下来」分开，并印出
-    「周五 15:30」这样的日期前缀。窗口宽度取 ``render.NEXT_DAYS``，只在渲染层定义一次。
-    每条都带 ``ref``：图上号就靠它跟 ``board_index`` 对上。
+    未来条目也带上 ``due``：渲染层靠它把「今日」「接下来」「更远」分开，并印出
+    「周五 15:30」/「2027-03-01」这样的日期。窗口宽度取 ``render.NEXT_DAYS``，
+    只在渲染层定义一次。每条都带 ``ref``：图上号就靠它跟 ``board_index`` 对上。
     """
     return [entry for entry in (_reminder_entry(name, item, ctx.today)
                                 for name, item in items) if entry is not None]
 
 
 def _reminder_entry(name: str, item: dict, today: date):
-    """一条 Reminder → 图上的一行；太远（超过 7 天）或没有 due 的返回 None。
+    """一条 Reminder → 视图条目；只有**没有 due** 的返回 None。
 
-    全天条目 ``at=None`` + ``all_day=True``：**不许把 00:00 当时刻**（EventKit 存的
-    全天就是本地零点）。时段条目的 12:00 / 18:00 是闹钟，另放 ``alarm``，不进 ``at``。
+    超过 7 天的**不再丢**（老板 2026-11-23：年度任务搬进 GTD 后视图上看不到）：
+    图上折进「更远」一行，文字视图全量列出。全天条目 ``at=None`` + ``all_day=True``：
+    **不许把 00:00 当时刻**（EventKit 存的全天就是本地零点）。时段条目的 12:00 / 18:00
+    是闹钟，另放 ``alarm``，不进 ``at``。
     """
     due = _item_due(item)
-    if due is None or (due.date() - today).days > render.NEXT_DAYS:
+    if due is None:
         return None
     all_day = bool(item.get("all_day"))
     at = None if all_day or due.time() == time(0, 0) else due.time()
