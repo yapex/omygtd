@@ -24,6 +24,9 @@ import pytest
 
 from gtd.inbox import PROJECT_ROOT
 from gtd.render import _find_chrome
+from gtd.reminders import TEST_LIST, RemindctlAdapter, _resolve_exe
+
+REMINDCTL = _resolve_exe("remindctl") or "remindctl"
 
 VERSION_RE = re.compile(r"gtd \d+\.\d+\.\d+")
 PNG_MIN_BYTES = 10 * 1024
@@ -35,13 +38,13 @@ BOARD_DRIVER = textwrap.dedent(
     from datetime import datetime
 
     from gtd import cli, reminders
-    from gtd.reminders import FakeStore
+    from gtd.reminders import TEST_LIST, FakeStore
 
     reminders.FORBIDDEN_IN_TESTS = set()
-    fake = FakeStore(lists=("GTD", "Waiting"))
-    fake.add("交材料", datetime(2026, 11, 23, 12, 0), "GTD", advance_minutes=0)
-    fake.add("回邮件", datetime(2026, 11, 22, 18, 0), "GTD")
-    fake.add("买鸡蛋", datetime(2026, 11, 24, 9, 0), "Waiting")
+    fake = FakeStore(lists=(TEST_LIST,))
+    fake.add("交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST, advance_minutes=0)
+    fake.add("回邮件", datetime(2026, 11, 22, 18, 0), TEST_LIST)
+    fake.add("买鸡蛋", datetime(2026, 11, 24, 9, 0), TEST_LIST)
     sys.exit(cli.main(sys.argv[1:], store=fake))
     '''
 )
@@ -109,19 +112,36 @@ def test_inbox_after_add_sees_the_thought_cross_process(tmp_path):
     assert data["items"][0]["seq"] == 1
 
 
-def test_add_with_time_is_refused_under_pytest(tmp_path):
-    """带时间的 ``add`` 在 pytest 里必须被守卫拦下：退出 1，且不写真实 Reminder。
+def test_add_with_time_lands_in_the_test_list(tmp_path):
+    """带时间的 ``add`` 在 pytest 里走**测试列表**：写进 GTD_TEST，真实 GTD 一条不多。
 
-    这是本文件唯一「时间路径」用例——CLI 没有 ``GTD_REMINDER_FAKE`` 之类的注入开关
-    （``reminders.py`` 只给 ``main(store=...)`` 这种进程内注入），所以跨进程不可能
-    走通成功路径而不碰老板的真实列表。与其假装测过，不如把守卫本身锁住。
+    2026-11-23 之前这个用例断言「被守卫拦下」，而那正是坑：worker 被拦之后绕去直接写
+    ``GTD``。现在临时库由 ``cli.target_list`` 自动改投 ``GTD_TEST``（列表不存在就
+    自动 ``list --create``），所以跨进程的成功路径既安全、又能真测。
     """
     db = tmp_path / "gtd.db"
-    proc = _gtd(tmp_path, "--db", str(db), "add", "明天中午前交材料")
-    assert proc.returncode == 1
+    title = "ZZ测试勿动跨进程临时库"
+    proc = _gtd(tmp_path, "--db", str(db), "add", f"明天中午前 {title}")
+    assert proc.returncode == 0, proc.stderr
     data = _payload(proc)
-    assert data["ok"] is False
-    assert "禁止写真实列表" in data["error"]
+    assert data["ok"] is True and data["list"] == TEST_LIST and data["title"] == title
+    rid = data["reminder_id"]
+    try:
+        assert title in _open_titles(TEST_LIST)
+        assert title not in _open_titles("GTD")
+    finally:                                  # 测试条目自己收尾：删掉，别留在 GTD_TEST
+        RemindctlAdapter().delete(rid)
+    assert title not in _open_titles(TEST_LIST)
+
+
+def _open_titles(list_name: str) -> list[str]:
+    """直接问 remindctl（读操作）某张列表里有哪些未完成条目的标题。"""
+    proc = subprocess.run([REMINDCTL, "show", "open", "--list", list_name, "--json"],
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        return []
+    return [str(item.get("title")) for item in json.loads(proc.stdout or "[]")
+            if isinstance(item, dict)]
 
 
 # ---------------------------------------------------------------- 4

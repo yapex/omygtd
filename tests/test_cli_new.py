@@ -23,7 +23,7 @@ import pytest
 
 from gtd import cli, reminders
 from gtd.inbox import Inbox, Mirror
-from gtd.reminders import FakeStore
+from gtd.reminders import TEST_LIST, FakeStore
 
 NOW = "2026-11-23 09:00"
 
@@ -77,7 +77,7 @@ def test_add_with_time_returns_seq_list_due_at(capsys, db, fake):
     code, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["seq"] == 1 and data["title"] == "交材料"
-    assert data["list"] == "GTD" and data["due"] == "2026-11-24" and data["at"] == "12:00"
+    assert data["list"] == TEST_LIST and data["due"] == "2026-11-24" and data["at"] == "12:00"
     assert data["matched"] == "明天中午前" and data["source"] == "reminder"
     assert data["reminder_id"].startswith("fake-")
 
@@ -86,7 +86,7 @@ def test_add_with_time_lands_in_store(capsys, db, fake):
     run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
     items = fake.all()
     assert [item["title"] for item in items] == ["交材料"]
-    assert items[0]["listName"] == "GTD"
+    assert items[0]["listName"] == TEST_LIST
     assert items[0]["dueDate"] == "2026-11-24 12:00"
 
 
@@ -155,7 +155,7 @@ def test_clarify_marks_inbox_row_moved(capsys, db, fake):
     assert data["title"] == "回设计稿"                  # 只说了时间，标题沿用 inbox 的
     # 下午 = 全天 + 18:00 响（t_0541f6c3）：at 不再报 18:00，改报 slot
     assert data["due"] == "2026-11-24" and data["at"] is None and data["slot"] == "pm"
-    assert data["list"] == "GTD" and data["inbox_id"] == inbox_id
+    assert data["list"] == TEST_LIST and data["inbox_id"] == inbox_id
     assert Inbox(db).pending() == []
     moved = rows(db, "select moved_at, reminder_id from inbox where id=?", inbox_id)[0]
     assert moved["moved_at"] is not None
@@ -311,9 +311,9 @@ def mirror_ids(db):
 
 
 def test_board_counts_match_data(capsys, db, fake, tmp_path, monkeypatch):
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
-    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), "GTD")
-    fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), "Waiting")   # 明天，不进今日图
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), TEST_LIST)
+    fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), TEST_LIST)   # 明天，不进今日图
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)            # inbox 一条
     seen = {}
 
@@ -336,9 +336,9 @@ def test_board_counts_match_data(capsys, db, fake, tmp_path, monkeypatch):
 
 def test_board_passes_seven_day_window_to_render(capsys, db, fake, tmp_path, monkeypatch):
     """窗口边界：7 天内（含第 7 天）的条目传给 render（进「接下来」区），第 8 天的不传。"""
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
-    fake.add("第七天的事", datetime(2026, 11, 30, 12, 0), "GTD")
-    fake.add("第八天的事", datetime(2026, 12, 1, 12, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("第七天的事", datetime(2026, 11, 30, 12, 0), TEST_LIST)
+    fake.add("第八天的事", datetime(2026, 12, 1, 12, 0), TEST_LIST)
     seen = {}
 
     def fake_render(entries, *, now, out_path):
@@ -367,9 +367,9 @@ def board_rows(db):
 
 def test_board_numbers_are_idempotent_across_five_runs(capsys, db, fake, out_dir,
                                                       monkeypatch):
-    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
-    fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
-    fake.add("丙", datetime(2026, 11, 27, 15, 30), "GTD")
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), TEST_LIST)
+    fake.add("乙", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("丙", datetime(2026, 11, 27, 15, 30), TEST_LIST)
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     first = run(capsys, ["board"], db=db, store=fake)[1]["numbers"]
     snapshot = board_rows(db)
@@ -379,25 +379,25 @@ def test_board_numbers_are_idempotent_across_five_runs(capsys, db, fake, out_dir
 
 
 def test_board_keeps_old_numbers_and_appends_new(capsys, db, fake, out_dir, monkeypatch):
-    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
-    fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), TEST_LIST)
+    fake.add("乙", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 2]
-    fake.add("丙", datetime(2026, 11, 23, 8, 0), "GTD")     # 今早，图上排最前面
+    fake.add("丙", datetime(2026, 11, 23, 8, 0), TEST_LIST)     # 今早，图上排最前面
     data = run(capsys, ["board"], db=db, store=fake)[1]
     assert data["numbers"] == [3, 1, 2], "老号不动，新条目拿 max+1=3（哪怕它排最前）"
 
 
 def test_board_drops_deleted_numbers_without_renumbering(capsys, db, fake, out_dir,
                                                          monkeypatch):
-    fake.add("甲", datetime(2026, 11, 23, 9, 0), "GTD")
-    gone = fake.add("乙", datetime(2026, 11, 23, 12, 0), "GTD")
-    fake.add("丙", datetime(2026, 11, 23, 15, 0), "GTD")
+    fake.add("甲", datetime(2026, 11, 23, 9, 0), TEST_LIST)
+    gone = fake.add("乙", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("丙", datetime(2026, 11, 23, 15, 0), TEST_LIST)
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 2, 3]
     fake.delete(gone)
     assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 3], "2 号空着不填补"
-    fake.add("丁", datetime(2026, 11, 23, 16, 0), "GTD")
+    fake.add("丁", datetime(2026, 11, 23, 16, 0), TEST_LIST)
     assert run(capsys, ["board"], db=db, store=fake)[1]["numbers"] == [1, 3, 4]
 
 
@@ -414,7 +414,7 @@ def test_board_leaves_daily_seq_alone(capsys, db, fake, out_dir, monkeypatch):
 def test_board_numbers_only_what_is_drawn(capsys, db, fake, out_dir, monkeypatch):
     """接下来区只露 5 条：第 6、7 条不上图，也就不占号（也不许崩）。"""
     for day in range(1, 8):
-        fake.add(f"第{day}天的事", datetime(2026, 11, 23 + day, 9, 0), "GTD")
+        fake.add(f"第{day}天的事", datetime(2026, 11, 23 + day, 9, 0), TEST_LIST)
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     code, data = run(capsys, ["board"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
@@ -426,8 +426,8 @@ def test_board_numbers_only_what_is_drawn(capsys, db, fake, out_dir, monkeypatch
 
 def test_board_rebuilds_mirror_with_all_open_reminders(capsys, db, fake, tmp_path, monkeypatch):
     """镜像存 Reminder 全量（含明天以后），不是「今天该看」那一份。"""
-    today = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
-    later = fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), "Waiting")   # 不进今日图
+    today = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    later = fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), TEST_LIST)   # 不进今日图
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
     monkeypatch.setattr(cli.render, "render_today", stub_render())
     out = tmp_path / "today.png"
@@ -441,7 +441,7 @@ def test_board_rebuilds_mirror_with_all_open_reminders(capsys, db, fake, tmp_pat
 
 def test_board_survives_mirror_failure(capsys, db, fake, tmp_path, monkeypatch):
     """镜像只是备份：写失败要进 warnings，board 仍然成功、退出码 0。"""
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
 
     class BadMirror:
         def __init__(self, *_args, **_kwargs):
@@ -463,7 +463,7 @@ def test_board_render_failure_does_not_write_mirror(capsys, db, fake, tmp_path, 
     """出图失败就不写镜像：否则会记下一个老板根本没看到的视图。"""
     Mirror(db).replace_all([{"reminder_id": "stale-0001", "title": "上次出图的残留",
                              "list_name": "GTD", "due_at": None, "completed": 0}])
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
 
     def boom(entries, *, now, out_path):
         raise RuntimeError("chrome 没了")
@@ -502,7 +502,7 @@ def out_dir(tmp_path, monkeypatch):
 
 def test_board_without_out_writes_unique_and_latest(capsys, db, fake, out_dir,
                                                     monkeypatch):
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     code, data = run(capsys, ["board"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
@@ -593,6 +593,7 @@ def test_human_output_names_all_day_and_slots(capsys, db, fake):
 
 
 def test_list_counts_per_list(capsys, db, fake):
+    # `list` 命令不跟 db 走：它数的是 store 里实际有哪几张列表（这几条只是种子）
     fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
     fake.add("买电池", datetime(2026, 11, 23, 20, 0), "GTD")
     fake.add("等对方回话", datetime(2026, 11, 24, 18, 0), "Waiting")
@@ -645,8 +646,8 @@ def test_add_precise_time_rings_at_that_moment(capsys, db, fake):
 def test_board_does_not_turn_all_day_midnight_into_a_clock(capsys, db, fake,
                                                            tmp_path, monkeypatch):
     """读路径：全天条目的 at 必须是 None（不许把本地 00:00 当时刻），闹钟另放。"""
-    fake.add("买菜", datetime(2026, 11, 23), "GTD", all_day=True)
-    fake.add("取快递", datetime(2026, 11, 23), "GTD", slot="pm")
+    fake.add("买菜", datetime(2026, 11, 23), TEST_LIST, all_day=True)
+    fake.add("取快递", datetime(2026, 11, 23), TEST_LIST, slot="pm")
     seen = {}
 
     def fake_render(entries, *, now, out_path):
@@ -682,9 +683,9 @@ def md_numbers(text):
 
 
 def test_view_numbers_match_board_numbers(capsys, db, fake, tmp_path, monkeypatch):
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
-    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), "GTD")
-    fake.add("把小米 SU7 送 4S 店保养", datetime(2026, 11, 27, 16, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
+    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), TEST_LIST)
+    fake.add("把小米 SU7 送 4S 店保养", datetime(2026, 11, 27, 16, 0), TEST_LIST)
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)          # 收件箱一条
     code, text = run_text(capsys, ["view"], db=db, store=fake)
     assert code == 0 and "**今天" in text
@@ -705,7 +706,7 @@ def test_view_writes_board_index_so_done_still_works(capsys, db, fake):
 
 
 def test_view_json_format_returns_structured_data(capsys, db, fake):
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
     code, text = run_text(capsys, ["view", "--format", "json"], db=db, store=fake)
     data = json.loads(text)                      # 结构化，不是 Markdown
@@ -723,8 +724,8 @@ def test_view_empty_store_renders_summary_only(capsys, db, fake):
 
 
 def test_view_markdown_shows_overdue_tag_and_next_section(capsys, db, fake):
-    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), "GTD")
-    fake.add("买菜", datetime(2026, 11, 24), "GTD", all_day=True)
+    fake.add("昨天该做完的", datetime(2026, 11, 22, 18, 0), TEST_LIST)
+    fake.add("买菜", datetime(2026, 11, 24), TEST_LIST, all_day=True)
     _, text = run_text(capsys, ["view"], db=db, store=fake)
     assert "（逾期 1 天）" in text and "**接下来**" in text
     assert "周二 全天" in text
@@ -800,7 +801,7 @@ def test_priority_rejects_level_outside_the_four(capsys, db, fake, tmp_path, mon
 def test_priority_sets_a_next_area_reminder_and_syncs_the_mirror(capsys, db, fake, tmp_path,
                                                                  monkeypatch):
     """接下来区的号也能设：改 Reminder 那条 + 本地镜像跟着变。"""
-    rid = fake.add("交材料", datetime(2026, 11, 24, 12, 0), "GTD")
+    rid = fake.add("交材料", datetime(2026, 11, 24, 12, 0), TEST_LIST)
     assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
@@ -811,12 +812,12 @@ def test_priority_sets_a_next_area_reminder_and_syncs_the_mirror(capsys, db, fak
     assert rows(db, "select priority from mirror where reminder_id=?", rid) == [
         {"priority": "high"}]
     _, text = run_text(capsys, ["view"], db=db, store=fake)
-    assert "| 1 | 周二 12:00 | !!! 交材料 | GTD |" in text
+    assert f"| 1 | 周二 12:00 | !!! 交材料 | {TEST_LIST} |" in text
 
 
 def test_priority_sets_a_today_area_reminder_to_medium(capsys, db, fake, tmp_path, monkeypatch):
     """今天区的号同样认：medium → 两个感叹号。"""
-    rid = fake.add("交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    rid = fake.add("交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     code, data = run(capsys, ["priority", "1", "medium"], db=db, store=fake)
     assert code == 0 and data["ok"] is True and data["mark"] == "!!"
@@ -824,12 +825,12 @@ def test_priority_sets_a_today_area_reminder_to_medium(capsys, db, fake, tmp_pat
     assert rows(db, "select priority from mirror where reminder_id=?", rid) == [
         {"priority": "medium"}]
     _, text = run_text(capsys, ["view"], db=db, store=fake)
-    assert "| 1 | 12:00 | !! 交材料 | GTD |" in text
+    assert f"| 1 | 12:00 | !! 交材料 | {TEST_LIST} |" in text
 
 
 def test_priority_on_a_reminder_is_idempotent(capsys, db, fake, tmp_path, monkeypatch):
     """同一档重复设不报错：ok:true + unchanged:true，且不再写 Reminder。"""
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD", priority="high")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST, priority="high")
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
     assert code == 0 and data["ok"] is True and data["unchanged"] is True
@@ -839,7 +840,7 @@ def test_priority_on_a_reminder_is_idempotent(capsys, db, fake, tmp_path, monkey
 
 def test_priority_none_clears_a_reminder_priority(capsys, db, fake, tmp_path, monkeypatch):
     """none 也是四档之一：把 Reminder 上的感叹号清掉。"""
-    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD", priority="high")
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST, priority="high")
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     code, data = run(capsys, ["priority", "1", "none"], db=db, store=fake)
     assert code == 0 and data["previous"] == "high" and data["mark"] == ""
@@ -850,7 +851,7 @@ def test_priority_none_clears_a_reminder_priority(capsys, db, fake, tmp_path, mo
 
 def test_priority_rejects_a_completed_reminder_number(capsys, db, fake, tmp_path, monkeypatch):
     """号在图上但那一条已经完成 → 1 号已完成，不许改。"""
-    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     fake.complete(rid)
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
@@ -862,7 +863,7 @@ def test_priority_rejects_a_completed_reminder_number(capsys, db, fake, tmp_path
 def test_priority_rejects_a_reminder_that_left_the_store(capsys, db, fake, tmp_path,
                                                         monkeypatch):
     """号在图上、Reminder 里已经删掉（手机上删的）→ 报「不在 Reminder 里了」。"""
-    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    rid = fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     fake.delete(rid)
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=fake)
@@ -877,7 +878,7 @@ def test_priority_reports_reminder_write_failure(capsys, db, no_guard, tmp_path,
             return False
 
     store = LockedStore(lists=("GTD", "Waiting"))
-    rid = store.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    rid = store.add("今天交材料", datetime(2026, 11, 23, 12, 0), TEST_LIST)
     fake_board(capsys, db, store, tmp_path, monkeypatch)
     code, data = run(capsys, ["priority", "1", "high"], db=db, store=store)
     assert code == 1 and data["ok"] is False and "没改成" in data["error"]

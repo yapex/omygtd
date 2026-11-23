@@ -61,6 +61,14 @@ class ReminderStore(Protocol):
         """确保自己负责的列表都存在。"""
         ...
 
+    def ensure_list(self, name: str) -> None:
+        """确保**单张**列表存在（幂等）：真实实现调 ``remindctl list <name> --create``。
+
+        测试库只需要建 ``GTD_TEST``，不该顺带把 GTD / Waiting 也拉进来，所以要单张接口。
+        没有这个方法的老鸭子实现由 cli 退回 ``ensure_lists()``。
+        """
+        ...
+
     def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,
             note: str = "", url: str = "",
@@ -263,9 +271,13 @@ class RemindctlAdapter:
 
     def ensure_lists(self) -> None:
         for name in self._lists:
-            _guard_list(name)
-            if name not in self._list_names():
-                self._run(["list", name, "--create", "--force"])
+            self.ensure_list(name)
+
+    def ensure_list(self, name: str) -> None:
+        """缺这张列表就建（``list <name> --create --force`` 幂等，已存在时不动条目）。"""
+        _guard_list(name)
+        if name not in self._list_names():
+            self._run(["list", name, "--create", "--force"])
 
     def _list_names(self) -> list[str]:
         proc = self._run(["list", "--json"])
@@ -369,17 +381,30 @@ class FakeStore:
     """纯内存实现，不碰真实 Reminder；行为与 adapter 对齐，用来测上层。"""
 
     def __init__(self, lists=(TEST_LIST,), available: bool = True):
-        self._lists = tuple(lists)
+        self._lists = list(lists)          # 这个假 Reminder 里「已存在」的列表
+        self.created: list[str] = []       # 由 ensure_list 新建的（模拟 list --create）
         self._available = bool(available)
         self._items: dict[str, dict] = {}
         self._seq = 0
+
+    @property
+    def lists(self) -> tuple[str, ...]:
+        """当前存在的列表名（含后续 ensure_list 新建的）。"""
+        return tuple(self._lists)
 
     def is_available(self) -> bool:
         return self._available
 
     def ensure_lists(self) -> None:
-        for name in self._lists:
-            _guard_list(name)
+        for name in tuple(self._lists):
+            self.ensure_list(name)
+
+    def ensure_list(self, name: str) -> None:
+        _guard_list(name)
+        if name in self._lists:
+            return
+        self._lists.append(name)
+        self.created.append(name)
 
     def add(self, title: str, due_at, list_name: str,
             advance_minutes: int | None = None,

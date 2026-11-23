@@ -195,7 +195,7 @@ def test_failed_command_is_logged_with_error(capsys, db, fake, log_path):
 def test_exception_path_logs_traceback(capsys, db, fake, log_path):
     """冒出来的异常（RuntimeError）也要留痕：error 原文 + traceback 末几行。"""
     class BoomStore(FakeStore):
-        def ensure_lists(self) -> None:
+        def ensure_list(self, name: str) -> None:      # 临时库只走单张 ensure_list
             raise RuntimeError("Reminder 后端崩了")
 
     run(capsys, ["add", "买鸡蛋"], db=db, store=fake)

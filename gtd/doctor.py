@@ -56,14 +56,18 @@ class Health:
 
 # ---------------------------------------------------------------- 主入口
 
-def check(*, inbox_db, store, now=None) -> Health:
-    """跑一次只读体检。``inbox_db`` 是本地库路径，``store`` 是 Reminder 存储。"""
+def check(*, inbox_db, store, now=None, lists=DEFAULT_LISTS) -> Health:
+    """跑一次只读体检。``inbox_db`` 是本地库路径，``store`` 是 Reminder 存储。
+
+    ``lists`` 是「算进镜像 / drift」的列表名集合：正式库是 ``GTD`` + ``Waiting``，
+    临时库（测试库）只有 ``GTD_TEST`` —— 否则临时库里出了图，drift 会因为数错列表而乱喊。
+    """
     inbox = Inbox(inbox_db)
     mirror = Mirror(inbox_db)
     lag = _lag_days(inbox, now)
     count = len(inbox.pending())
     ok = _reminder_ok(store)
-    remote = _remote_rows(store) if ok else []
+    remote = _remote_rows(store, lists) if ok else []
     local = mirror.all()
     seconds = board_seconds()
     drift = _drift(len(local), len(remote), ok)
@@ -79,7 +83,7 @@ def check(*, inbox_db, store, now=None) -> Health:
     )
 
 
-def rebuild_mirror(*, inbox_db, store, now=None) -> int:
+def rebuild_mirror(*, inbox_db, store, now=None, lists=DEFAULT_LISTS) -> int:
     """按 Reminder 当前状态整表重建本地镜像，返回写入条数。
 
     手动动作：``check()`` 不会调它。Reminder 不可用时**拒绝重建** —— 否则会拿
@@ -87,7 +91,7 @@ def rebuild_mirror(*, inbox_db, store, now=None) -> int:
     """
     if not _reminder_ok(store):
         raise RuntimeError("Reminder 不可用，拒绝重建镜像（会把本地备份清空）")
-    rows = [row for row in (_mirror_row(item) for item in _remote_rows(store))
+    rows = [row for row in (_mirror_row(item) for item in _remote_rows(store, lists))
             if row["reminder_id"]]
     return Mirror(inbox_db).replace_all(rows, now=now)
 
@@ -100,9 +104,9 @@ def _lag_days(inbox: Inbox, now) -> int | None:
     return 0 if lag is None else max(0, lag)
 
 
-def _remote_rows(store) -> list[dict]:
-    """Reminder 里 ``GTD`` / ``Waiting`` 未完成的条目（一张表才算得准）。"""
-    names = set(DEFAULT_LISTS)
+def _remote_rows(store, lists=DEFAULT_LISTS) -> list[dict]:
+    """Reminder 里指定列表（正式库 ``GTD`` / ``Waiting``）未完成的条目（一张表才算得准）。"""
+    names = set(lists)
     return [item for item in store.all()
             if str(item.get("listName")) in names and not item.get("isCompleted")]
 

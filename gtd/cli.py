@@ -6,7 +6,9 @@
 依赖注入：
 - ``store``：``ReminderStore`` 从外面传进来（测试传 ``FakeStore``），本模块不认识 remindctl
 - ``now``：``--now "2026-11-23 09:00"`` 或 ``main(now=...)`` 钉死时钟（测试用）
-- ``--db``：本地库路径（inbox / daily_seq / mirror），默认 ``data/gtd.db``，也认 ``GTD_DB``
+- ``--db``：本地库路径（inbox / daily_seq / mirror），默认 ``data/gtd.db``，也认 ``GTD_DB``。
+  **不是正式库就给 Reminder 开沙盒**：写入（add / clarify）一律落 ``GTD_TEST``，
+  出图 / view / doctor 也只读 ``GTD_TEST``；列表不存在先自动 ``list --create``。
 
 分工：
 - **有时间的任务全在 Reminder**；本地只记 inbox（没时间的念头）、当日序号、镜像。
@@ -31,7 +33,7 @@ from pathlib import Path
 from . import (__version__, audit, doctor, lock, parser as nlp, priority as prio,
                repeat as rep, render)
 from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
-from .reminders import RemindctlAdapter, ReminderStore
+from .reminders import TEST_LIST, RemindctlAdapter, ReminderStore
 
 EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
 LISTS = (nlp.LIST_DEFAULT, nlp.LIST_WAITING)
@@ -55,6 +57,24 @@ class Result:
     audit: dict | None = None          # 审计材料（parsed / before / after），main 负责落盘
 
 
+def is_prod_db(db) -> bool:
+    """这次写的是不是正式库 ``data/gtd.db``（其余路径一律当临时/测试库）。"""
+    return Path(db or ":memory:").resolve() == Path(DEFAULT_DB).resolve()
+
+
+def target_list(db, parsed=None) -> str:
+    """写 Reminder 用哪张列表：**非正式库一律 GTD_TEST**（测试隔离），正式库按解析结果。
+
+    老板 2026-11-23 定的规矩：临时库 / 测试库写来的任务不许混进真实 ``GTD``。
+    原来靠人记「测试记得带 --db / 写 GTD_TEST」，worker 一不知道建列表就绕去写 GTD，
+    所以改成按 db 路径硬判（这里一处决定，add / clarify 都走它）。
+    """
+    if not is_prod_db(db):
+        return TEST_LIST
+    picked = getattr(parsed, "list", None)
+    return picked if picked in LISTS else nlp.LIST_DEFAULT
+
+
 @dataclass
 class Context:
     """一次命令执行的上下文：本地库四张表 + Reminder 存储 + 钉住的时刻。"""
@@ -64,10 +84,21 @@ class Context:
     board: BoardIndex
     store: ReminderStore
     now: datetime
+    db: str = ""                       # 这次写的本地库；决定 Reminder 目标列表（见 test_db）
 
     @property
     def today(self) -> date:
         return self.now.date()
+
+    @property
+    def test_db(self) -> bool:
+        """写的不是正式库 → 当测试库：Reminder 必须落 GTD_TEST（别污染老板的真实列表）。"""
+        return not is_prod_db(self.db)
+
+    @property
+    def list_name(self) -> str:
+        """这次写哪张 Reminder 列表（正式库 GTD，其它一律 GTD_TEST）。"""
+        return target_list(self.db)
 
 
 # ---------------------------------------------------------------- 入口
@@ -124,7 +155,7 @@ def _guard_prod_db(args) -> None:
     if not _in_kanban_worker():
         return                              # 老板手动跑，不受影响
     db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
-    if Path(db).resolve() != Path(DEFAULT_DB).resolve():
+    if not is_prod_db(db):
         return                              # --db / GTD_DB 指到别处：临时库，放行
     raise RuntimeError(
         f"Kanban worker 禁止连正式库 {DEFAULT_DB}（会污染真实数据）。"
@@ -173,7 +204,7 @@ def _context(args, store, now) -> Context:
     moment = _moment(now if now is not None else args.now)
     db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
     return Context(Inbox(db), Seq(db), BoardIndex(db),
-                   store if store is not None else RemindctlAdapter(), moment)
+                   store if store is not None else RemindctlAdapter(), moment, str(db))
 
 
 def _write(payload: dict, human: bool, command: str = "") -> None:
@@ -205,8 +236,9 @@ def _hhmm(moment: datetime) -> str:
     return moment.strftime("%H:%M")
 
 
-def _list_of(parsed) -> str:
-    return parsed.list if parsed.list in LISTS else nlp.LIST_DEFAULT
+def _list_of(ctx: Context, parsed) -> str:
+    """这次写哪张列表：跟着库走（临时库 → GTD_TEST），不看人记不记得。"""
+    return target_list(ctx.db, parsed)
 
 
 def _due_at(parsed, now: datetime) -> datetime | None:
@@ -227,9 +259,25 @@ def _advance(parsed) -> int | None:
     return parsed.advance_minutes if parsed.advance_minutes is not None else 0
 
 
-def _ensure_lists(store: ReminderStore) -> None:
-    """真实实现里缺列表要建（GTD / Waiting）；FakeStore 里是空操作。"""
-    store.ensure_lists()
+def _ensure_lists(ctx: Context) -> None:
+    """写之前确保目标列表存在：正式库建 GTD / Waiting，临时库只建 GTD_TEST。
+
+    ``remindctl list <name> --create`` 是幂等的（已存在时不动里面的条目），
+    所以新机器 / 列表被删了也能自愈。
+    """
+    if not ctx.test_db:
+        ctx.store.ensure_lists()
+        return
+    _ensure_one(ctx.store, TEST_LIST)
+
+
+def _ensure_one(store: ReminderStore, name: str) -> None:
+    """确保单张列表存在；老鸭子实现没有 ``ensure_list`` 就退回全量 ``ensure_lists``。"""
+    ensure = getattr(store, "ensure_list", None)
+    if ensure is None:
+        store.ensure_lists()
+        return
+    ensure(name)
 
 
 def _seq_of(ctx: Context, ref: str) -> int:
@@ -346,8 +394,8 @@ def cmd_add(ctx: Context, args) -> Result:
     due_at = _due_at(parsed, ctx.now)
     if due_at is None:
         return _audited(_park(ctx, parsed, args.note, level=level), parsed)
-    _ensure_lists(ctx.store)
-    reminder_id = ctx.store.add(parsed.title, due_at, _list_of(parsed),
+    _ensure_lists(ctx)
+    reminder_id = ctx.store.add(parsed.title, due_at, _list_of(ctx, parsed),
                                 advance_minutes=_advance(parsed),
                                 note=args.note,
                                 all_day=parsed.all_day, slot=parsed.slot,
@@ -362,7 +410,7 @@ def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None
             level=None) -> dict:
     """写成功后的回执：``at`` 只报具体时刻，全天/时段另给标记（别把 00:00 当时刻）。"""
     return {"ok": True, "seq": _seq_of(ctx, f"reminder:{reminder_id}"),
-            "title": title or parsed.title, "list": _list_of(parsed),
+            "title": title or parsed.title, "list": _list_of(ctx, parsed),
             "due": due_at.date().isoformat(),
             "at": _hhmm(due_at) if parsed.at is not None else None,
             "all_day": parsed.all_day, "slot": parsed.slot,
@@ -423,8 +471,8 @@ def cmd_clarify(ctx: Context, args) -> Result:
                                code=EXIT_FAIL), parsed, before)
     title = parsed.title or row["title"]
     level = parsed.priority if prio.is_set(parsed.priority) else prio.normalize(row.get("priority"))
-    _ensure_lists(ctx.store)
-    reminder_id = ctx.store.add(title, due_at, _list_of(parsed),
+    _ensure_lists(ctx)
+    reminder_id = ctx.store.add(title, due_at, _list_of(ctx, parsed),
                                 advance_minutes=_advance(parsed),
                                 note=row["note"],
                                 all_day=parsed.all_day, slot=parsed.slot,
@@ -560,8 +608,13 @@ def _board_numbers(ctx: Context, order) -> dict[str, int]:
 
 
 def _open_items(ctx: Context) -> list[tuple[str, dict]]:
-    """``GTD`` / ``Waiting`` 里未完成的全部条目（含明天以后）：镜像要全量。"""
-    return [(name, item) for name in LISTS for item in ctx.store.pending(name)]
+    """``GTD`` / ``Waiting`` 里未完成的全部条目（含明天以后）：镜像要全量。
+
+    临时库（测试库）只读 ``GTD_TEST``：写进去的测试条目本来就落那儿，读侧跟着走，
+    「临时库 add 完再 view」才能看见自己刚加的那条。正式库不受影响。
+    """
+    names = (TEST_LIST,) if ctx.test_db else LISTS
+    return [(name, item) for name in names for item in ctx.store.pending(name)]
 
 
 def _today_tasks(ctx: Context, items) -> list:
@@ -858,7 +911,8 @@ def cmd_list(ctx: Context, _args) -> Result:
 
 def cmd_doctor(ctx: Context, _args) -> Result:
     """体检：只读，修不修由人定。problems 非空 = 有病，退出码 1。"""
-    health = doctor.check(inbox_db=ctx.inbox.db_path, store=ctx.store, now=ctx.now)
+    health = doctor.check(inbox_db=ctx.inbox.db_path, store=ctx.store, now=ctx.now,
+                          lists=(TEST_LIST,) if ctx.test_db else doctor.DEFAULT_LISTS)
     payload = {"ok": health.ok, "inbox_lag_days": health.inbox_lag_days,
                "inbox_count": health.inbox_count, "reminder_ok": health.reminder_ok,
                "mirror_drift": health.mirror_drift,
