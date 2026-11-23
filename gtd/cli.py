@@ -36,6 +36,12 @@ from .reminders import RemindctlAdapter, ReminderStore
 EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
 LISTS = (nlp.LIST_DEFAULT, nlp.LIST_WAITING)
 OUT_ENV = "GTD_OUT"
+ALLOW_PROD_ENV = "GTD_ALLOW_PROD"           # 显式逃生门：worker 确实要动正式库时设 1
+# worker 判据：看板卡进程的标记变量（dispatcher 注入）。实测 2026-11-23：
+# worker 的 terminal 子 shell 里没有 HERMES_KANBAN_TASK，但 WORKSPACE / DB 在，
+# 所以按「任一存在」判定，别只认一个名字。
+WORKER_ENV = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
+              "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB")
 STAMP_FMT = "%Y-%m-%d %H:%M"
 INBOX_LIST_LABEL = "inbox"
 SLOT_WORDS = {"am": "上午", "pm": "下午"}      # --human 回执用的时段词
@@ -74,6 +80,7 @@ def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
     except SystemExit as exc:          # argparse：未知命令、缺参数 → 2；--help → 0
         return int(exc.code or 0)
     try:
+        _guard_prod_db(args)            # worker 默认连正式库 → 先拒，别等开了库才发现
         with _write_lock(args, raw):
             ctx = _context(args, store, now)
             result = DISPATCH[args.command](ctx, args)
@@ -98,6 +105,31 @@ def _write_lock(args, raw):
         return nullcontext()
     db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
     return lock.write_lock(db, tag=" ".join(raw))
+
+
+def _in_kanban_worker() -> bool:
+    """是不是看板卡的 worker 进程： ``HERMES_KANBAN_*`` 由 dispatcher 注入，人自己没有。"""
+    return any(os.environ.get(name) for name in WORKER_ENV)
+
+
+def _guard_prod_db(args) -> None:
+    """禁止 worker 默认连正式库——它做端到端测试会把老板的真实数据写脏。
+
+    2026-11-23 事故：卡 t_84767dcd 的 worker 跑 ``gtd clarify 7 "明天下午"`` 没带
+    ``--db``，直接澄清了老板真库里的一条念头。只拦**写**命令（``lock.WRITE_COMMANDS``）；
+    ``view`` / ``board`` / ``list`` / ``doctor`` 对正式库只读，照旧放行。
+    """
+    if args.command not in lock.WRITE_COMMANDS or os.environ.get(ALLOW_PROD_ENV) == "1":
+        return
+    if not _in_kanban_worker():
+        return                              # 老板手动跑，不受影响
+    db = args.db or os.environ.get("GTD_DB") or DEFAULT_DB
+    if Path(db).resolve() != Path(DEFAULT_DB).resolve():
+        return                              # --db / GTD_DB 指到别处：临时库，放行
+    raise RuntimeError(
+        f"Kanban worker 禁止连正式库 {DEFAULT_DB}（会污染真实数据）。"
+        f"重跑请加 --db <临时路径>（或设 GTD_DB=<临时路径>）；"
+        f"确实要动正式库时设 {ALLOW_PROD_ENV}=1 并说明理由。")
 
 
 def _audit(args, raw, material, code, payload, *, tb=None) -> None:
