@@ -20,9 +20,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from itertools import count
 from pathlib import Path
 
@@ -159,9 +160,28 @@ def _age_days(row: dict, now: datetime) -> int:
     return max(0, (now.date() - created).days)
 
 
+def _out_root() -> Path:
+    return Path(os.environ.get(OUT_ENV) or PROJECT_ROOT / "out")
+
+
 def _default_out(day: date) -> Path:
-    root = Path(os.environ.get(OUT_ENV) or PROJECT_ROOT / "out")
-    return root / f"today-{day.strftime('%Y%m%d')}.png"
+    """当天最新副本：``out/today-YYYYMMDD.png``（cron / 人可直接引用这个固定路径）。"""
+    return _out_root() / f"today-{day.strftime('%Y%m%d')}.png"
+
+
+def _unique_out(stamp: datetime) -> Path:
+    """带时刻的唯一名：``out/board-YYYYMMDD-HHMMSS.png``，供推送绕开客户端缓存。
+
+    同一秒内连出两次图会撞名（撞了客户端又按路径缓存），撞到已存在的就顺延一秒。
+    """
+    root = _out_root()
+    candidate = root / f"board-{stamp.strftime('%Y%m%d-%H%M%S')}.png"
+    for step in range(60):
+        if not candidate.exists():
+            return candidate
+        moment = stamp + timedelta(seconds=step + 1)
+        candidate = root / f"board-{moment.strftime('%Y%m%d-%H%M%S')}.png"
+    return candidate
 
 
 # ---------------------------------------------------------------- add
@@ -270,6 +290,10 @@ def cmd_board(ctx: Context, args) -> Result:
     出图**成功之后**顺手整表重建 mirror（``drift`` 于是变成「上次出图以后
     Reminder 被改过」的信号）。顺序不能反：出图失败就不写镜像，否则会记下
     一个用户根本没看到的视图。镜像写失败只进 ``warnings``，board 仍然成功。
+
+    默认落两个文件：唯一名 ``out/board-YYYYMMDD-HHMMSS.png``（``path``，推送用
+    它绕开客户端按路径缓存）＋当天最新副本 ``out/today-YYYYMMDD.png``（``latest``，
+    供 cron / 人直接引用）。``--out`` 显式给了就只写那一个，``latest`` 为 None。
     """
     known = {ref: seq for seq, ref in ctx.seq.all(day=ctx.today).items()}
     counter = count(max(known.values(), default=0) + 1)
@@ -277,9 +301,16 @@ def cmd_board(ctx: Context, args) -> Result:
     tasks = _today_tasks(ctx, items, known, counter)
     loose = _inbox_entries(ctx, known, counter)
     entries = tasks + loose
-    out = Path(args.out).expanduser() if args.out else _default_out(ctx.today)
+    explicit = Path(args.out).expanduser() if args.out else None
+    out = explicit or _unique_out(datetime.now())      # 时刻取本地墙钟，不是 UTC
+    out.parent.mkdir(parents=True, exist_ok=True)
     path = render.render_today(entries, now=ctx.now, out_path=out)
-    payload = {"ok": True, "path": str(path), "count": len(entries),
+    latest = None if explicit else _default_out(ctx.today)
+    if latest is not None:                     # 实体副本（copy2），不用软链
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, latest)
+    payload = {"ok": True, "path": str(path), "latest": str(latest) if latest else None,
+               "count": len(entries),
                "overdue": sum(1 for entry in entries if entry.overdue_days > 0),
                "inbox": len(loose)}
     warnings = _mirror_after_board(ctx, items)
@@ -486,7 +517,9 @@ def _clarify(sub) -> None:
 
 def _board(sub) -> None:
     p = sub.add_parser("board", help="出今日视图（一张 PNG）")
-    p.add_argument("--out", metavar="PATH", help="图片路径；默认 out/today-YYYYMMDD.png")
+    p.add_argument("--out", metavar="PATH",
+                   help="只写这一个路径；不给就落 out/board-YYYYMMDD-HHMMSS.png "
+                        "＋ out/today-YYYYMMDD.png（当天最新副本）")
 
 
 def _done(sub) -> None:

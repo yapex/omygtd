@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -343,6 +344,84 @@ def test_board_render_failure_does_not_write_mirror(capsys, db, fake, tmp_path, 
     code, data = run(capsys, ["board", "--out", str(tmp_path / "today.png")], db=db, store=fake)
     assert code == 1 and data["ok"] is False
     assert mirror_ids(db) == ["stale-0001"]         # 原样不动
+
+
+# ---------------------------------------------------------------- board → 缓存绕开
+#
+# 事故背景：同一天出两次图都写到 out/today-YYYYMMDD.png，推给老板后他手机上看
+# 到的还是第一版——客户端按路径缓存，文件名没变就不重新取。所以现在默认落两个
+# 文件：唯一名（推送用）＋ 当天最新副本（cron 引用）。
+
+def counting_render():
+    """每次出图写不同字节，用来区分「这一版」和「上一版」。"""
+    state = {"n": 0}
+
+    def fake_render(entries, *, now, out_path):
+        state["n"] += 1
+        Path(out_path).write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([state["n"]]))
+        return Path(out_path)
+
+    return fake_render
+
+
+@pytest.fixture()
+def out_dir(tmp_path, monkeypatch):
+    """把 GTD_OUT 指到 tmp：默认落盘别写进项目 out/。"""
+    folder = tmp_path / "out"
+    monkeypatch.setenv("GTD_OUT", str(folder))
+    return folder
+
+
+def test_board_without_out_writes_unique_and_latest(capsys, db, fake, out_dir,
+                                                    monkeypatch):
+    fake.add("今天交材料", datetime(2026, 11, 23, 12, 0), "GTD")
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    code, data = run(capsys, ["board"], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["path"] != data["latest"]
+    assert Path(data["path"]).exists() and Path(data["latest"]).exists()
+    assert Path(data["latest"]).name == "today-20261123.png"
+    assert sorted(p.name for p in out_dir.iterdir()) == sorted(
+        [Path(data["path"]).name, "today-20261123.png"])
+
+
+def test_board_with_explicit_out_writes_only_that_file(capsys, db, fake, out_dir,
+                                                       tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    explicit = tmp_path / "explicit.png"
+    code, data = run(capsys, ["board", "--out", str(explicit)], db=db, store=fake)
+    assert code == 0 and data["ok"] is True
+    assert data["path"] == str(explicit) and Path(explicit).exists()
+    assert data["latest"] in (None, data["path"])
+    assert not out_dir.exists() or list(out_dir.iterdir()) == []
+
+
+def test_board_twice_latest_matches_second_unique(capsys, db, fake, out_dir,
+                                                  monkeypatch):
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    first = run(capsys, ["board"], db=db, store=fake)[1]
+    second = run(capsys, ["board"], db=db, store=fake)[1]
+    assert first["path"] != second["path"]          # 同一秒内撞名会自动顺延
+    latest = Path(second["latest"])
+    assert latest.read_bytes() == Path(second["path"]).read_bytes()
+    assert latest.read_bytes() != Path(first["path"]).read_bytes()
+    assert latest.read_bytes() == b"\x89PNG\r\n\x1a\n\x02"   # 第二版的内容
+
+
+def test_board_unique_name_matches_stamp_pattern(capsys, db, fake, out_dir,
+                                                 monkeypatch):
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    data = run(capsys, ["board"], db=db, store=fake)[1]
+    name = Path(data["path"]).name
+    assert re.fullmatch(r"board-\d{8}-\d{6}\.png", name), name
+
+
+def test_board_creates_missing_out_dir(capsys, db, fake, tmp_path, monkeypatch):
+    nested = tmp_path / "deep" / "out"
+    monkeypatch.setenv("GTD_OUT", str(nested))
+    monkeypatch.setattr(cli.render, "render_today", counting_render())
+    code, data = run(capsys, ["board"], db=db, store=fake)
+    assert code == 0 and Path(data["path"]).exists() and Path(data["latest"]).exists()
 
 
 # ---------------------------------------------------------------- 注入与退出码
