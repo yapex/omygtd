@@ -33,6 +33,10 @@ metadata:
 
 secretary-gate 已加拦截：`remindctl add/edit/complete/delete` 一律拒绝，只读（`list`/`show`/`status`）放行。
 
+**worker 不许写生产库**：CLI 的 `_guard_prod_db` 会在免交互环境（worker）下直接拒掉对正式库 `data/gtd.db` 的写调用。写老板真实待办只能主会话做——给分身派「GTD 端到端测试」只会拿到 RuntimeError，测试一律用 `--db <临时路径>`（自动落 `GTD_TEST` 列表）。
+
+**收件箱条目的 `done` ≠ 完成**：inbox 里还没澄清的念头标 done 只写 `moved_at`，不生成提醒、也没有回滚。老板说「X 要完成」时的动作是 `gtd clarify` 把它澄清成当天待办，不是 `gtd done`。
+
 ## 入参口径（2026-11-24 老板拍板，v2.2）
 
 **归一由调用方（LLM）负责，CLI 不接受口语。** 你说「明天下午三点提醒我」时，
