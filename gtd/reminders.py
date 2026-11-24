@@ -96,6 +96,17 @@ class ReminderStore(Protocol):
         """
         ...
 
+    def reschedule(self, reminder_id: str, due_at, *,
+                   advance_minutes: int | None = None,
+                   all_day: bool = False, slot: str | None = None) -> bool:
+        """改一条提醒的到期时间（**改期，不是完成**）；失败返回 False。
+
+        语义与 ``add`` 完全同一套：``all_day`` / ``slot`` 决定 due 走全天还是时刻，
+        ``slot=am/pm`` 另挂 12:00 / 18:00 闹钟；``advance_minutes`` 是提前量
+        （0 = 到点即响，None = 不设闹钟）。
+        """
+        ...
+
     def delete(self, reminder_id: str) -> bool:
         """删除；失败返回 False。"""
         ...
@@ -343,6 +354,22 @@ class RemindctlAdapter:
         args = ["edit", str(reminder_id), "--priority", prio.normalize(level), "--json"]
         return _ok(self._run(args))
 
+    def reschedule(self, reminder_id: str, due_at, *,
+                   advance_minutes: int | None = None,
+                   all_day: bool = False, slot: str | None = None) -> bool:
+        """``remindctl edit <id> --due …``：原地改期，不完成、不重建。
+
+        实测（2026-11-24，GTD_TEST，rc=0）：``edit --due`` 能改掉 ``dueDate``，
+        ``dueDateIsAllDay`` 跟着日期/时刻写法自动翻转（只给日期 → true）。
+        **旧闹钟不会自己消失**：把有闹钟的条目改回全天，``alarmDate`` 仍停在旧时刻。
+        所以这里不传 ``--alarm`` 就显式 ``--clear-alarm``，否则手机上会在旧时刻响。
+        """
+        due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
+        alarm = _alarm_of(due_at, advance_minutes, day_only=day_only, alarm=alarm)
+        args = ["edit", str(reminder_id), "--due", due_text]
+        args += ["--alarm", _stamp(alarm)] if alarm is not None else ["--clear-alarm"]
+        return _ok(self._run(args + ["--json"]))
+
     def pending(self, list_name: str) -> list[dict]:
         _guard_list(list_name)
         proc = self._run(["show", "open", "--list", list_name, "--json"])
@@ -386,6 +413,7 @@ class FakeStore:
         self._available = bool(available)
         self._items: dict[str, dict] = {}
         self._seq = 0
+        self.rescheduled: list[dict] = []  # reschedule 的调用记录：断言传给 store 的真值
 
     @property
     def lists(self) -> tuple[str, ...]:
@@ -448,6 +476,24 @@ class FakeStore:
         if item is None:
             return False
         item["priority"] = prio.normalize(level)
+        return True
+
+    def reschedule(self, reminder_id: str, due_at, *,
+                   advance_minutes: int | None = None,
+                   all_day: bool = False, slot: str | None = None) -> bool:
+        """与 adapter 同构：按 ``add`` 的规则算 due/alarm，再原地改这一条。"""
+        item = self._items.get(str(reminder_id))
+        if item is None:
+            return False
+        due_text, alarm, day_only = _reminder_when(due_at, all_day=all_day, slot=slot)
+        alarm = _alarm_of(due_at, advance_minutes, day_only=day_only, alarm=alarm)
+        item["dueDate"] = due_text
+        item["dueDateIsAllDay"] = day_only
+        item["all_day"] = day_only
+        item["alarmDate"] = _stamp(alarm) if alarm else ""
+        self.rescheduled.append({"id": str(reminder_id), "due_at": due_at,
+                                 "due": due_text, "all_day": day_only, "slot": slot,
+                                 "alarm": item["alarmDate"]})
         return True
 
     def pending(self, list_name: str) -> list[dict]:

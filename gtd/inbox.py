@@ -358,6 +358,17 @@ class Mirror(_LocalTable):
             (normalize(value), _iso(_now(now)), str(reminder_id)))
         return cur.rowcount > 0
 
+    def set_due(self, reminder_id: str, due_at, *, now=None) -> bool:
+        """改镜像里那一条的到期时间（Reminder 已改成功后同步，别让本地副本撒谎）。
+
+        ``due_at`` 传**改完之后从 Reminder 读回的值**（与 ``_mirror_row`` 同格式，
+        都是本地墙钟串），这样镜像跟整表重建的结果一致。
+        """
+        cur = self._db().execute(
+            "UPDATE mirror SET due_at=?, synced_at=? WHERE reminder_id=?",
+            (due_at, _iso(_now(now)), str(reminder_id)))
+        return cur.rowcount > 0
+
 
 # ---------------------------------------------------------------- board_index
 

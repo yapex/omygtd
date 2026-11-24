@@ -1,7 +1,7 @@
 ---
 name: gtd
 description: 记待办、看今日、勾完成。触发「记一下」「今天做什么」「看收件箱」。
-version: 2.0.0
+version: 2.1.0
 metadata:
   hermes:
     tags: [gtd, todo, personal]
@@ -23,6 +23,7 @@ metadata:
 | 要做的事 | 用 |
 |---|---|
 | 完成某条 | `gtd done <图上编号>` |
+| 改期 | `gtd defer <图上编号> "<时间词>"` |
 | 新增 | `gtd add "<原话>"` |
 | 查看 | `gtd view` |
 | 体检 | `gtd doctor` |
@@ -43,6 +44,7 @@ gtd clarify <N> "<文字>"          # 给收件箱念头补时间；N 是 view /
 gtd view [--format {md,json}]    # 全库视图，md 是默认
 gtd board [--out PATH]           # 出 PNG：board-YYYYMMDD-HHMMSS.png + today-YYYYMMDD.png
 gtd done <N...>                  # 按图上编号完成，可多个
+gtd defer <N...> WHEN            # 按图上编号改到期时间（改期，不是完成）
 gtd list                         # Reminder 各列表条数
 gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 镜像漂移
 ```
@@ -52,7 +54,7 @@ gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 
 - `--now "2026-11-23 09:00"` 钉住时刻（测试用）
 - `add` 幂等：内容指纹 + **2 分钟**窗口，不要传 key
 
-**v1 写法已全部失效**：`--due` / `--slot` / `--category` / `--waiting-on` / `--defer` / `board --view` / `board --format` / `edit` / `show` / `undo` / `backup` / `sync`。传了直接 `unrecognized arguments`（退出码 2）。
+**v1 写法已全部失效**：`--due` / `--slot` / `--category` / `--waiting-on` / `--defer`（`--defer` 是旧旗标）/ `board --view` / `board --format` / `edit` / `show` / `undo` / `backup` / `sync`。传了直接 `unrecognized arguments`（退出码 2）。改期现在是**子命令** `gtd defer`，不是旗标。
 
 ## 时间怎么落
 
@@ -68,6 +70,10 @@ gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 
 | 「买鸡蛋」（无时间词） | 进收件箱 | 不提醒，等澄清 |
 
 差别在「什么时候办都行」（全天）还是「有个截止点」（精确时刻）。
+
+`gtd defer 9 12 明天上午` 里那个时间词**走同一个 parser**，上面这张表原样适用：
+只给日期 → 全天无闹钟，上午/下午 → 全天 + 12:00/18:00 闹钟，精确钟点 → due 就是那一刻。
+时间词固定在**最后一个位置**（`defer 9 12 明天`），多号一次改完。
 
 **解析器细节**：时间词之间可以有空格（「今天晚上 10 点半」和「今天晚上10点半」都对）；只剥离**句首连续的时间前缀**，句中出现的钟点不会抢时刻（「明天中午前交材料，顺便看看 3 点的会」→ 12:00，不是 15:00）。
 
@@ -88,6 +94,9 @@ gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 
 - 今天没出过图 → 拒绝，让他先看
 - 图上没这个号 → 拒绝
 - 那条已完成 → 拒绝
+
+`defer N WHEN` 同规则；**改期后号不变**——引用没变，只是日子变了，不用重新看图。
+收件箱里的号 `defer` 也拒（念头还没进 Reminder，没有到期时间），改用 `clarify`。
 
 ## 记完回文字（2026-11-23 老板定）
 
@@ -148,12 +157,14 @@ gtd view
 
 **不许**在没确认写入成功的情况下说「已记录」。
 
-## 三个已验证的坑
+## 四个已验证的坑
 
 **Reminder 存 UTC**：`dueDate` 是 `2026-11-23T14:30:00Z` 这种，读的时候必须转本地。犯过——图上把 22:30 显示成 14:30，老板会以为还早。写侧送本地墙钟是对的，错只在读侧。
 
 **紧急响铃 EventKit 不暴露**：Reminders.app 界面有 Urgent 开关，但 EventKit 没这个属性。要开只能手动进 app。
 
 **子任务未验证**：Reminders.app 界面支持子任务，但 EventKit 是否暴露父子关系**没查清**（调研被取消了）。目前一条主任务带多个子项时，记成独立的多条提醒。
+
+**改期必须显式清闹钟**：`remindctl edit --due` 只改 dueDate，**旧闹钟不会自己消失**——把带闹钟的条目改回全天，`alarmDate` 仍停在旧时刻，手机上会在旧时间响。所以 `defer` 不传 `--alarm` 时就发 `--clear-alarm`（2026-11-24 实测：删掉这步会留旧闹钟）。
 
 **`remindctl list` 的计数只算未完成**：要看全量条数（含已完成）用 `--json` 读 `total`，否则「库里到底多少条」会系统性少报（2026-11-23 实测）。`gtd list` 同源，报数前先想清楚问的是哪一种。

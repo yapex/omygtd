@@ -74,9 +74,9 @@ def holder_thread(db, seconds):
 
 # ---------------------------------------------------------------- 粒度与位置
 
-def test_write_commands_are_exactly_the_four_write_paths():
-    """写锁只认四个写命令；view / board / list / doctor 一个都不许进来。"""
-    assert set(lock.WRITE_COMMANDS) == {"add", "clarify", "done", "priority"}
+def test_write_commands_are_exactly_the_five_write_paths():
+    """写锁只认五个写命令（defer 也改 Reminder）；view / board / list / doctor 都不许进来。"""
+    assert set(lock.WRITE_COMMANDS) == {"add", "clarify", "done", "priority", "defer"}
 
 
 def test_lock_file_lives_next_to_the_db(tmp_path):

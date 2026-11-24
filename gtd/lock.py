@@ -10,7 +10,7 @@
 
 粒度与边界：
 - 一把全局锁 ``<db 所在目录>/.gtd.lock``，只锁**写**命令（``add`` / ``clarify`` /
-  ``done`` / ``priority``）；``view`` / ``board`` / ``list`` / ``doctor`` 只读，不加锁。
+  ``done`` / ``priority`` / ``defer``）；``view`` / ``board`` / ``list`` / ``doctor`` 只读，不加锁。
 - 锁文件与 db 同级，所以 ``--db /tmp/x.db`` 与正式库各锁各的，测试不互相阻塞。
 - 锁文件里写持有者（pid / 时刻 / 命令行）**只为人排查**；判断谁持有锁只看 flock，
   绝不读这个文件做判据。
@@ -31,7 +31,7 @@ from .inbox import PROJECT_ROOT
 LOCK_NAME = ".gtd.lock"
 WAIT_SECONDS = 10.0                     # 拿不到锁最多等这么久
 POLL_SECONDS = 0.2                      # 重试间隔
-WRITE_COMMANDS = frozenset({"add", "clarify", "done", "priority"})
+WRITE_COMMANDS = frozenset({"add", "clarify", "done", "priority", "defer"})
 KEEP_TAG = 120                          # 锁文件里命令行最多留这么多字符
 
 

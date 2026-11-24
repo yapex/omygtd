@@ -1,4 +1,4 @@
-"""命令层 v2：add / inbox / clarify / board / done / list。
+"""命令层 v2：add / inbox / clarify / board / done / defer / list。
 
 老板经对话让我调 CLI（不是自己敲），所以**默认输出 JSON**（机器读），
 ``--human`` 才给人看。退出码：0 成功 / 1 业务失败 / 2 参数错误。
@@ -895,6 +895,106 @@ def _reminder_problem(ctx: Context, reminder_id: str) -> str | None:
     return "这条已经不在 Reminder 里了，重新看图"
 
 
+# ---------------------------------------------------------------- defer
+
+def cmd_defer(ctx: Context, args) -> Result:
+    """按**图上的号**改到期时间：改期，不是完成，也不重建条目。
+
+    时间词走 ``parser.parse``（与 add 同一套）：只给日期 → 全天、无闹钟；
+    上午 / 下午 → 全天 + 12:00 / 18:00 闹钟；精确钟点 → due 就是那一刻。
+    时间词固定在最后（``defer 9 12 明天``），多号一次改完。
+
+    号来自 ``board_index``，规则与 done 一致（没出图 / 没这个号 / 已完成 都拒）。
+    引用不变，所以**图上号也不变**：同一条只是换了日子，不重新编号。
+    镜像那一行的 due 跟着改（可整表重建的备份，别让本地副本落后）。
+    """
+    parsed = nlp.parse(args.when, now=ctx.now)
+    if _due_at(parsed, ctx.now) is None:
+        return _audited(Result({"ok": False, "results": [],
+                                "error": f"没从「{args.when}」里听出时间"
+                                         f"（defer 只改期，不改标题）"}, code=EXIT_PARAM),
+                        parsed)
+    before = _defer_snapshot(ctx, args.seqs)
+    results = [_defer_one(ctx, raw, parsed, args.when) for raw in args.seqs]
+    ok = all(item["ok"] for item in results)
+    return _audited(Result({"ok": ok, "results": results},
+                           code=EXIT_OK if ok else EXIT_FAIL),
+                    parsed, before, after=results)
+
+
+def _defer_one(ctx: Context, raw, parsed, when: str) -> dict:
+    """改一条的到期时间；号不对 / 已完成 / 还在收件箱都返回 ok:False。"""
+    try:
+        number = int(raw)
+    except (TypeError, ValueError):
+        return {"seq": raw, "ok": False, "error": "序号不是整数"}
+    ref, problem = _board_ref(ctx, number)
+    if problem or ref is None:
+        return {"seq": number, "ok": False, "error": problem or f"今天没有 {number} 号"}
+    kind, _, target = ref.partition(":")
+    if kind == INBOX_LIST_LABEL:      # 念头还没进 Reminder，没有到期时间可改
+        return {"seq": number, "ok": False, "ref": ref, "source": INBOX_LIST_LABEL,
+                "error": f"{number} 号还在收件箱里（没有到期时间）；"
+                         f"用 gtd clarify {number} \"{when}\" 定时间"}
+    if kind != "reminder":
+        return {"seq": number, "ok": False, "ref": ref, "error": f"不认识的引用 {ref}"}
+    gone = _reminder_problem(ctx, target)
+    if gone:
+        return {"seq": number, "ok": False, "ref": ref, "error": gone}
+    due_at = _due_at(parsed, ctx.now)
+    changed = ctx.store.reschedule(target, due_at, advance_minutes=_advance(parsed),
+                                   all_day=parsed.all_day, slot=parsed.slot)
+    if not changed:
+        return {"seq": number, "ok": False, "ref": ref, "source": "reminder",
+                "error": f"{number} 号的到期时间没改成（Reminder 写失败）"}
+    item = {"seq": number, "ok": True, "ref": ref, "source": "reminder",
+            "due": due_at.date().isoformat(),
+            "at": _hhmm(due_at) if parsed.at is not None else None,
+            "all_day": _day_only(parsed), "slot": parsed.slot, "reminder_id": target}
+    warnings = _sync_mirror_due(ctx, target)
+    return {**item, "warnings": warnings} if warnings else item
+
+
+def _day_only(parsed) -> bool:
+    """存进 Reminder 的 due 是不是「只有日期」：时段（上午/下午）也走全天，只是另挂闹钟。"""
+    return bool(parsed.all_day or parsed.slot)
+
+
+def _defer_snapshot(ctx: Context, raws) -> list[dict]:
+    """改期之前每条的状态：号 → 引用 → 原来的 due / 闹钟（审计的 before）。"""
+    snapshots = []
+    for raw in raws:
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            snapshots.append({"seq": raw, "error": "序号不是整数"})
+            continue
+        ref, problem = _board_ref(ctx, number)
+        snapshots.append(_defer_state(ctx, number, ref, problem))
+    return snapshots
+
+
+def _defer_state(ctx: Context, number: int, ref: str | None, problem: str | None) -> dict:
+    """一条 defer 的 before 快照（号不对就只留原因）。"""
+    if problem or ref is None:
+        return {"seq": number, "error": problem}
+    kind, _, target = ref.partition(":")
+    item = _reminder_item(ctx, target) if kind == "reminder" else None
+    return {"seq": number, "ref": ref, "due": (item or {}).get("dueDate"),
+            "alarm": (item or {}).get("alarmDate")}
+
+
+def _sync_mirror_due(ctx: Context, reminder_id: str) -> list[str]:
+    """镜像那一行的 due 跟着改（读改后的真值）；失败只进 warnings。"""
+    item = _reminder_item(ctx, reminder_id)
+    try:
+        if item is not None:
+            Mirror(ctx.inbox.db_path).set_due(reminder_id, item.get("dueDate"), now=ctx.now)
+    except Exception as exc:      # noqa: BLE001 —— 镜像落后只是备份旧了
+        return [f"镜像同步失败：{exc}"]
+    return []
+
+
 # ---------------------------------------------------------------- list
 
 def cmd_list(ctx: Context, _args) -> Result:
@@ -929,6 +1029,8 @@ def cmd_doctor(ctx: Context, _args) -> Result:
 def _human(command: str, payload: dict) -> str:
     if command == "doctor":
         return _human_doctor(payload)
+    if command == "defer":
+        return _human_defer(payload)
     if not payload.get("ok", True):
         return f"✗ {payload.get('error') or '失败'}"
     if command in ("add", "clarify"):
@@ -1010,6 +1112,22 @@ def _human_done(payload: dict) -> str:
     return "✓ 完成"
 
 
+def _human_defer(payload: dict) -> str:
+    """``--human defer``：一行一条「✓ #3 改到 2026-11-24 上午」。"""
+    results = payload.get("results") or []
+    if not results:
+        return f"✗ {payload.get('error') or '失败'}"
+    return "\n".join(_human_defer_line(item) for item in results)
+
+
+def _human_defer_line(item: dict) -> str:
+    """单条改期回执：失败印原因，成功印「改到哪天哪一段」。"""
+    if not item.get("ok"):
+        return f"✗ #{item.get('seq')} {item.get('error') or '失败'}"
+    clock = item.get("at") or SLOT_WORDS.get(str(item.get("slot") or "")) or ALL_DAY_WORD
+    return f"✓ #{item['seq']} 改到 {item.get('due')} {clock}"
+
+
 def _human_doctor(payload: dict) -> str:
     if payload.get("error"):
         return f"✗ {payload['error']}"
@@ -1024,7 +1142,8 @@ def _human_doctor(payload: dict) -> str:
 
 DISPATCH = {"add": cmd_add, "inbox": cmd_inbox, "clarify": cmd_clarify,
             "priority": cmd_priority, "board": cmd_board, "view": cmd_view,
-            "done": cmd_done, "list": cmd_list, "doctor": cmd_doctor}
+            "done": cmd_done, "defer": cmd_defer, "list": cmd_list,
+            "doctor": cmd_doctor}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1037,7 +1156,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="钉住当前时刻（测试用），如 '2026-11-23 09:00'")
     parser.add_argument("--human", action="store_true", help="给人看的文字输出（默认 JSON）")
     sub = parser.add_subparsers(dest="command", required=True)
-    for builder in (_add, _inbox, _clarify, _priority, _board, _view, _done, _list, _doctor):
+    for builder in (_add, _inbox, _clarify, _priority, _board, _view, _done, _defer,
+                    _list, _doctor):
         builder(sub)
     return parser
 
@@ -1083,6 +1203,14 @@ def _view(sub) -> None:
 def _done(sub) -> None:
     p = sub.add_parser("done", help="按当日序号完成（可多个）")
     p.add_argument("seqs", nargs="+")
+
+
+def _defer(sub) -> None:
+    p = sub.add_parser("defer", help="按当日序号改到期时间（改期，不是完成；可多个）")
+    p.add_argument("seqs", nargs="+", metavar="N...",
+                   help="图上号；时间词固定在最后：defer 9 12 明天上午")
+    p.add_argument("when", metavar="WHEN",
+                   help="时间词，与 add 同一套：明天 / 明天上午 / 明天10点 / 今晚10点半")
 
 
 def _list(sub) -> None:
