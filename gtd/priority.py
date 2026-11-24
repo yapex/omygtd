@@ -5,7 +5,7 @@
 high → ``!!!``、medium → ``!!``、low → ``!``、none → 不印。
 
 本模块只管「词汇 + 排序 + 显示标记」三件事：不读库、不解析参数、不认识渲染格式。
-上层（parser / inbox / reminders / render / cli）共用这一份，别在别处再抄一份映射。
+上层（cli / inbox / reminders / render / timeutil）共用这一份，别在别处再抄一份映射。
 """
 
 from __future__ import annotations

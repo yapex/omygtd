@@ -113,13 +113,13 @@ def test_log_directory_is_gitignored():
 # ---------------------------------------------------------------- 一条改了什么都记下来
 
 def test_add_writes_one_line_with_parsed_before_after(capsys, db, fake, log_path):
-    code, _ = run(capsys, ["add", "明天下午交材料"], db=db, store=fake)
+    code, _ = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0
     rows = entries(log_path)
     assert len(rows) == 1
     row = rows[0]
     assert row["cmd"] == "add" and row["result"] == "ok" and row["exit"] == 0
-    assert row["argv"][0] == "gtd" and row["argv"][-1] == "明天下午交材料"
+    assert row["argv"][0] == "gtd" and row["argv"][-1] == "pm"
     assert "add" in row["argv"]
     assert row["parsed"]["title"] == "交材料"
     assert row["parsed"]["due"] == "2026-11-24" and row["parsed"]["slot"] == "pm"
@@ -131,7 +131,7 @@ def test_add_writes_one_line_with_parsed_before_after(capsys, db, fake, log_path
 def test_three_write_commands_each_log_one_line(capsys, db, fake, tmp_path, monkeypatch,
                                                 log_path):
     """add / priority / done 连跑：日志按顺序三条，before/after 能看出改了什么。"""
-    run(capsys, ["add", "明天下午交材料"], db=db, store=fake)      # 进 Reminder（图上 1 号）
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)      # 进 Reminder（图上 1 号）
     run(capsys, ["add", "买鸡蛋"], db=db, store=fake)              # 进收件箱（图上 2 号）
     board = fake_board(capsys, db, fake, tmp_path, monkeypatch)
     number = str(board["numbers"][0])
@@ -151,7 +151,7 @@ def test_three_write_commands_each_log_one_line(capsys, db, fake, tmp_path, monk
 def test_clarify_records_inbox_before_and_after(capsys, db, fake, log_path):
     """今天的坑的正脸：moved_at / reminder_id 的「改前 / 改后」都在日志里。"""
     run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
-    code, data = run(capsys, ["clarify", "1", "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", "1", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0
     row = entries(log_path)[-1]
     assert row["before"]["inbox_id"] == data["inbox_id"]
@@ -166,7 +166,7 @@ def test_at_is_wall_clock_while_now_is_injected(capsys, db, fake, log_path, monk
     """今天的坑的锁：`at` 是真实墙钟，`now` 才是 --now 的业务时间，两者必须不同。"""
     monkeypatch.setattr(audit, "wall_clock",
                         lambda: datetime(2026, 11, 23, 17, 15, 3, tzinfo=CST))
-    run(capsys, ["add", "明天下午交材料"], db=db, store=fake, now="2026-11-23 16:00")
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake, now="2026-11-23 16:00")
     row = entries(log_path)[0]
     assert row["at"] == "2026-11-23T17:15:03+08:00"
     assert row["now"] == "2026-11-23T16:00:00"
@@ -199,7 +199,7 @@ def test_exception_path_logs_traceback(capsys, db, fake, log_path):
             raise RuntimeError("Reminder 后端崩了")
 
     run(capsys, ["add", "买鸡蛋"], db=db, store=fake)
-    code = cli.main(["--db", str(db), "--now", NOW, "clarify", "1", "明天下午"],
+    code = cli.main(["--db", str(db), "--now", NOW, "clarify", "1", "--due", "2026-11-24", "--slot", "pm"],
                     store=BoomStore(lists=("GTD", "Waiting")))
     capsys.readouterr()
     assert code == 1

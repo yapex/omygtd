@@ -1,7 +1,7 @@
 ---
 name: gtd
 description: 记待办、看今日、勾完成。触发「记一下」「今天做什么」「看收件箱」。
-version: 2.1.0
+version: 2.2.0
 metadata:
   hermes:
     tags: [gtd, todo, personal]
@@ -23,8 +23,8 @@ metadata:
 | 要做的事 | 用 |
 |---|---|
 | 完成某条 | `gtd done <图上编号>` |
-| 改期 | `gtd defer <图上编号> "<时间词>"` |
-| 新增 | `gtd add "<原话>"` |
+| 改期 | `gtd defer <图上编号> --due 2026-12-08` |
+| 新增 | `gtd add "<标题>" --due 2026-12-01` |
 | 查看 | `gtd view` |
 | 体检 | `gtd doctor` |
 
@@ -33,53 +33,72 @@ metadata:
 
 secretary-gate 已加拦截：`remindctl add/edit/complete/delete` 一律拒绝，只读（`list`/`show`/`status`）放行。
 
-## 命令（v2 实测接口）
+## 入参口径（2026-11-24 老板拍板，v2.2）
+
+**归一由调用方（LLM）负责，CLI 不接受口语。** 你说「明天下午三点提醒我」时，
+先把话翻译成标准旗标再调 CLI：
+
+```
+「明天下午三点」→ --due 2026-11-26 --at 15:00
+「下周一」       → --due 2026-11-30
+「每周一例会」   → --due 2026-11-30 --repeat weekly
+```
+
+`--due` 只收 `YYYY-MM-DD`，`--at` 只收 24 小时制 `HH:MM`。传「明天」「9点」这类口语
+直接**退出码 2**（一条都不写），并回一句带正确示例的错误——不猜、不兜底、不做兼容。
+理由：用程序文法枚举口语永远追不完，接口只吃标准格式，换算放在调用方。
+
+## 命令（v2.2 实测接口）
 
 ```
 gtd [--db PATH] [--now WHEN] [--human] <subcommand>
 
-gtd add "<标题>" [--note T]      # 有时间进 Reminder，没时间进收件箱
-gtd inbox                        # 收件箱里还没迁出的念头
-gtd clarify <N> "<文字>"          # 给收件箱念头补时间；N 是 view / inbox 上的号
-gtd view [--format {md,json}]    # 全库视图，md 是默认
-gtd board [--out PATH]           # 出 PNG：board-YYYYMMDD-HHMMSS.png + today-YYYYMMDD.png
-gtd done <N...>                  # 按图上编号完成，可多个
-gtd defer <N...> WHEN            # 按图上编号改到期时间（改期，不是完成）
-gtd list                         # Reminder 各列表条数
-gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 镜像漂移
+gtd add "<标题>" [--due YYYY-MM-DD] [--at HH:MM | --slot am|pm]
+                 [--repeat daily|weekly|monthly] [--repeat-interval N]
+                 [--priority none|low|medium|high] [--note T]
+gtd inbox                                        # 收件箱里还没迁出的念头
+gtd clarify <N> --due YYYY-MM-DD [--at HH:MM | --slot am|pm]
+gtd view [--format {md,json}]                    # 全库视图，md 是默认
+gtd board [--out PATH]                           # 出 PNG：board-YYYYMMDD-HHMMSS.png + today-YYYYMMDD.png
+gtd done <N...>                                  # 按图上编号完成，可多个
+gtd defer <N...> --due YYYY-MM-DD [--at HH:MM | --slot am|pm]
+gtd priority <N> <none|low|medium|high>
+gtd list                                         # Reminder 各列表条数
+gtd doctor                                       # 体检：收件箱积压 / Reminder 可用 / 镜像漂移
 ```
 
 - 全局参数 `--human` 必须在子命令**前**：`gtd --human list`
-- 默认输出 JSON；退出码 **0 成功 / 1 业务失败（号不对、已完成、写失败）/ 2 参数错（时间词听不出、参数不合法）**
+- 默认输出 JSON；退出码 **0 成功 / 1 业务失败（号不对、已完成、写失败）/ 2 参数错（日期或钟点不合标准格式、旗标组合不合法）**
 - `--now "2026-11-23 09:00"` 钉住时刻（测试用）
 - `add` 幂等：内容指纹 + **2 分钟**窗口，不要传 key
 
-**v1 写法已全部失效**：`--due` / `--slot` / `--category` / `--waiting-on` / `--defer`（`--defer` 是旧旗标）/ `board --view` / `board --format` / `edit` / `show` / `undo` / `backup` / `sync`。传了直接 `unrecognized arguments`（退出码 2）。改期现在是**子命令** `gtd defer`，不是旗标。
+**旧写法已全部失效**：口语时间词（`gtd add "明天 买菜"` 想让 CLI 自己听懂）、`defer 9 明天`、
+`clarify 3 "明天下午"`、`--category` / `--waiting-on` / 旧旗标 `--defer`、`board --view` /
+`board --format`、`edit` / `show` / `undo` / `backup` / `sync`。传了直接 `unrecognized arguments`
+或退出码 2。改期现在是**子命令** `gtd defer`，不是旗标。
 
-## 时间怎么落
+## 时间怎么落（四种形态）
 
-由 `parser` 从原话自动解析，**不需要也不接受手动指定**：
-
-| 你说 | 存成 | 手机上 |
+| 传什么 | Reminder 存成 | 手机上 |
 |---|---|---|
-| 「明天 买菜」 | due 全天，无闹钟 | 整天挂锁屏，不响 |
-| 「明天上午 交材料」 | due 全天 + 12:00 闹钟 | 整天挂着，中午响一次 |
-| 「明天下午 开会」 | due 全天 + 18:00 闹钟 | 整天挂着，18:00 响 |
-| 「明天中午前 交材料」 | 精确 12:00 | 到点响 |
-| 「今晚 10 点半 卖股票」 | 精确 22:30 | 到点响 |
-| 「买鸡蛋」（无时间词） | 进收件箱 | 不提醒，等澄清 |
+| 不给 `--due` | 进收件箱，不排期 | 不提醒，等澄清 |
+| `--due 2026-12-01` | due 全天，无闹钟 | 整天挂锁屏，不响 |
+| `--due 2026-12-01 --slot am` | due 全天 + 12:00 闹钟 | 整天挂着，中午响一次 |
+| `--due 2026-12-01 --slot pm` | due 全天 + 18:00 闹钟 | 整天挂着，18:00 响 |
+| `--due 2026-12-01 --at 09:30` | due 就是 09:30，到点响 | 到点响 |
 
+`--at` 与 `--slot` **互斥**（同时给 → 退出码 2）；`--at` / `--slot` 必须跟 `--due` 一起给。
 差别在「什么时候办都行」（全天）还是「有个截止点」（精确时刻）。
 
-`gtd defer 9 12 明天上午` 里那个时间词**走同一个 parser**，上面这张表原样适用：
-只给日期 → 全天无闹钟，上午/下午 → 全天 + 12:00/18:00 闹钟，精确钟点 → due 就是那一刻。
-时间词固定在**最后一个位置**（`defer 9 12 明天`），多号一次改完。
+`gtd defer` / `gtd clarify` 用**同一套旗标**，语义完全一致：
 
-`defer` 的退出码（与代码 `EXIT_OK / EXIT_FAIL / EXIT_PARAM` 一致）：全改成功 → 0；
-号不对 / 那条已完成 / 收件箱号 / **重复任务** / 写失败 → 1（`results[].ok=false`，逐条给 `error`）；
-时间词听不出 → 2（一条都不改）。
+```
+gtd defer 9 12 --due 2026-12-08 --slot am     # 9、12 号改到 12-08 上午
+gtd clarify 3 --due 2026-12-01 --at 09:30     # 收件箱 3 号落成 12-01 09:30
+```
 
-**解析器细节**：时间词之间可以有空格（「今天晚上 10 点半」和「今天晚上10点半」都对）；只剥离**句首连续的时间前缀**，句中出现的钟点不会抢时刻（「明天中午前交材料，顺便看看 3 点的会」→ 12:00，不是 15:00）。
+`defer` 的退出码：全改成功 → 0；号不对 / 那条已完成 / 收件箱号 / **重复任务** / 写失败 → 1
+（`results[].ok=false`，逐条给 `error`）；`--due` 缺失或格式不对 → 2（一条都不改）。
 
 **不说时间就留收件箱**，不要硬凑日期。
 
@@ -99,8 +118,9 @@ gtd doctor                       # 体检：收件箱积压 / Reminder 可用 / 
 - 图上没这个号 → 拒绝
 - 那条已完成 → 拒绝
 
-`defer N WHEN` 同规则；**改期后号不变**——引用没变，只是日子变了，不用重新看图。
-收件箱里的号 `defer` 也拒（念头还没进 Reminder，没有到期时间），改用 `gtd clarify <N> "<时间>"`——**单一职责：`defer` 只改已有到期时间，不给念头补时间**。
+`defer N` 同规则；**改期后号不变**——引用没变，只是日子变了，不用重新看图。
+收件箱里的号 `defer` 也拒（念头还没进 Reminder，没有到期时间），改用 `gtd clarify <N> --due ...`
+——**单一职责：`defer` 只改已有到期时间，不给念头补时间**。
 带重复规则（`recurrenceRule`）的条目 `defer` 也拒：EventKit 的周期以 due 为锚点，改这一条会把整条链的节奏一起挪走，要改节奏去 Reminders.app 改频率。
 
 ## 记完回文字（2026-11-23 老板定）
@@ -132,7 +152,8 @@ gtd view
 
 **两个入口**：
 
-1. **记的时候说**：「很重要」「急」「着急」→ `high`；「重要」「优先」→ `medium`。parser 自动识别，并把这些词从标题里剥掉。
+1. **记的时候传**：`gtd add "做分析" --priority high`（reminder 与收件箱都认）。
+   「很重要 / 急」这类说法**不再自动识别**——标题会原样入库，档位只从旗标来。
 2. **看视图后改**：`gtd priority <N> <level>`
    - 收件箱条目 → 改本地 `inbox.priority`
    - 今天区 / 接下来区 → 改 Reminder 那条（`remindctl edit --priority`），手机同步变
@@ -143,8 +164,16 @@ gtd view
 
 ## 重复（交给 Reminder 原生，不自研）
 
-识别：`每天/每周/每两周/每月/每年/每 N 天|周|个月` → 传 `remindctl --repeat`。
-存进 Reminder 后是 `recurrenceRule {frequency, interval}`，例如「每 5 天」= `{daily, 5}`。
+`--repeat daily|weekly|monthly` + `--repeat-interval N`（默认 1）→ 传 `remindctl --repeat`。
+`--due` 那天就是**锚点**：
+
+```
+gtd add "例会" --due 2026-11-30 --repeat weekly                  # 每周一（11-30 是周一）
+gtd add "领券" --due 2026-11-28 --repeat daily --repeat-interval 5   # 每 5 天
+```
+
+映射：`weekly + 2` → `every 2 weeks` → EventKit `{frequency: weekly, interval: 2}`；
+`daily + 5` → `{daily, 5}`。`--repeat` 必须跟 `--due`（锚点不能猜）。
 
 **语义（实测，2026-11-23）**：
 - **完成时**才往前滚 +N 天，同时另生成一条已完成快照
@@ -157,12 +186,12 @@ gtd view
 必须说清三件事：
 
 1. **没记上**（不要含糊说「有点问题」）
-2. **失败原因**（解析不出时间 / Reminder 不可用 / 库写失败）
+2. **失败原因**（日期格式不对 / Reminder 不可用 / 库写失败）
 3. **原话复述**，并问要不要再试
 
 **不许**在没确认写入成功的情况下说「已记录」。
 
-## 四个已验证的坑
+## 已验证的坑
 
 **Reminder 存 UTC**：`dueDate` 是 `2026-11-23T14:30:00Z` 这种，读的时候必须转本地。犯过——图上把 22:30 显示成 14:30，老板会以为还早。写侧送本地墙钟是对的，错只在读侧。
 
@@ -170,7 +199,7 @@ gtd view
 
 **子任务未验证**：Reminders.app 界面支持子任务，但 EventKit 是否暴露父子关系**没查清**（调研被取消了）。目前一条主任务带多个子项时，记成独立的多条提醒。
 
-**重复任务不能 defer（2026-11-24 实测）**：`weekly / interval=1` 那条 `gtd defer` 之后 `recurrenceRule` 本身没变（频率、interval 都在），但 `complete` 往前滚的是**改后的 due**——周一 11-30 的任务 defer 到周三 11-25，滚出来是 12-02（周三），原周一锚点丢了（滚动后的 `alarmDate` 还被写成当天 00:00）。所以 `defer` 见到 `recurrenceRule` 直接拒，返回 `ok:false` + 「重复任务暂不支持 defer…请改 Reminder 里的频率」。另：「每周一 例会」**不是**重复任务——解析器把「每周X」当星期几，只有「周一 每周 例会」这种写法才会传 `--repeat`。
+**重复任务不能 defer（2026-11-24 实测）**：`weekly / interval=1` 那条 `gtd defer` 之后 `recurrenceRule` 本身没变（频率、interval 都在），但 `complete` 往前滚的是**改后的 due**——周一 11-30 的任务 defer 到周三 11-25，滚出来是 12-02（周三），原周一锚点丢了（滚动后的 `alarmDate` 还被写成当天 00:00）。所以 `defer` 见到 `recurrenceRule` 直接拒，返回 `ok:false` + 「重复任务暂不支持 defer…请改 Reminder 里的频率」。
 
 **改期必须显式清闹钟**：`remindctl edit --due` 只改 dueDate，**旧闹钟不会自己消失**——把带闹钟的条目改回全天，`alarmDate` 仍停在旧时刻，手机上会在旧时间响。所以 `defer` 不传 `--alarm` 时就发 `--clear-alarm`（2026-11-24 实测：删掉这步会留旧闹钟）。
 

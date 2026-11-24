@@ -1,13 +1,11 @@
-"""``gtd defer``：按图上号改到期时间（改期，不是完成）。
+"""``gtd defer``：按图上号改到期时间（改期，不是完成），严格入参。
 
-判据全部落在 **store 实际收到的参数** 上（``FakeStore.rescheduled`` 记的是传给
-``reschedule`` 的 ``due_at`` 原值，精确到分钟），不只断言 ``ok=True`` ——
-「改到哪一天几点」说错了，界面上照样是绿的。
+判据落在 **store 实际收到的参数** 上（``FakeStore.rescheduled`` 记的是传给
+``reschedule`` 的原值，精确到分钟），不只断言 ``ok=True`` —— 「改到哪一天几点」
+说错了，界面上照样是绿的。
 
-时间语义与 ``add`` 同一套（都走 ``gtd/parser.py``）：
-- 只给日期 → due 全天、无闹钟
-- 上午 / 下午 → due 全天 + 12:00 / 18:00 闹钟
-- 精确钟点 → due 就是那一刻
+时间只认旗标（与 add 同一套）：``--due YYYY-MM-DD``；``--slot am|pm`` → 全天 +
+12:00/18:00 闹钟；``--at HH:MM`` → due 就是那一刻。
 """
 
 from __future__ import annotations
@@ -23,8 +21,8 @@ from gtd.inbox import BoardIndex
 from gtd.reminders import TEST_LIST, FakeStore, RemindctlAdapter
 
 NOW = "2026-11-23 09:00"          # 周一
-TOMORROW = "2026-11-24"
-DAY_AFTER = "2026-11-25"
+DUE = "2026-11-24"
+NEXT_DUE = "2026-11-25"
 
 
 # ---------------------------------------------------------------- 夹具与工具
@@ -60,6 +58,13 @@ def board(capsys, db, store, tmp_path, monkeypatch) -> dict:
                db=db, store=store)[1]
 
 
+def seed(capsys, db, store, tmp_path, monkeypatch, argv=("--due", DUE, "--at", "12:00")) -> dict:
+    """记一条带时间的任务并出图（号 1）。"""
+    added = run(capsys, ["add", "交材料", *argv], db=db, store=store)[1]
+    board(capsys, db, store, tmp_path, monkeypatch)
+    return added
+
+
 def item_of(store, reminder_id: str) -> dict:
     return next(item for item in store.all() if item["id"] == reminder_id)
 
@@ -68,14 +73,13 @@ def item_of(store, reminder_id: str) -> dict:
 
 def test_defer_date_only_sets_all_day_without_alarm(capsys, db, fake,
                                                     tmp_path, monkeypatch):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
-    board(capsys, db, fake, tmp_path, monkeypatch)
+    added = seed(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "1", "后天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", NEXT_DUE], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     result = data["results"][0]
     assert result["seq"] == 1 and result["ok"] is True
-    assert result["due"] == DAY_AFTER and result["at"] is None
+    assert result["due"] == NEXT_DUE and result["at"] is None
     assert result["all_day"] is True and result["slot"] is None
     assert result["source"] == "reminder"
 
@@ -83,50 +87,46 @@ def test_defer_date_only_sets_all_day_without_alarm(capsys, db, fake,
     assert sent["id"] == added["reminder_id"]
     assert sent["due_at"] == datetime(2026, 11, 25, 0, 0)
     assert sent["all_day"] is True and sent["slot"] is None
-    assert sent["due"] == DAY_AFTER and sent["alarm"] == ""
+    assert sent["due"] == NEXT_DUE and sent["alarm"] == ""
 
     stored = item_of(fake, added["reminder_id"])
-    assert stored["dueDate"] == DAY_AFTER
+    assert stored["dueDate"] == NEXT_DUE
     assert stored["dueDateIsAllDay"] is True
     assert stored["alarmDate"] == ""
 
 
-# ---------------------------------------------------------------- 上午 / 下午
+# ---------------------------------------------------------------- 时段
 
-@pytest.mark.parametrize("when,slot,alarm", [
-    ("明天上午", "am", "2026-11-24 12:00"),
-    ("明天下午", "pm", "2026-11-24 18:00"),
-])
-def test_defer_slot_keeps_all_day_and_sets_slot_alarm(capsys, db, fake,
-                                                      tmp_path, monkeypatch,
-                                                      when, slot, alarm):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
-    board(capsys, db, fake, tmp_path, monkeypatch)
+@pytest.mark.parametrize("slot,alarm", [("am", "2026-11-24 12:00"),
+                                        ("pm", "2026-11-24 18:00")])
+def test_defer_slot_keeps_all_day_and_sets_slot_alarm(capsys, db, fake, tmp_path,
+                                                      monkeypatch, slot, alarm):
+    added = seed(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "1", when], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", DUE, "--slot", slot],
+                     db=db, store=fake)
     assert code == 0
     result = data["results"][0]
-    assert result["due"] == TOMORROW and result["slot"] == slot
+    assert result["due"] == DUE and result["slot"] == slot
     assert result["all_day"] is True and result["at"] is None
 
     sent = fake.rescheduled[-1]
     assert sent["due_at"] == datetime(2026, 11, 24, 0, 0)
-    assert sent["due"] == TOMORROW and sent["alarm"] == alarm
+    assert sent["due"] == DUE and sent["alarm"] == alarm
     assert sent["all_day"] is True
 
     stored = item_of(fake, added["reminder_id"])
-    assert stored["dueDate"] == TOMORROW
-    assert stored["dueDateIsAllDay"] is True
+    assert stored["dueDate"] == DUE and stored["dueDateIsAllDay"] is True
     assert stored["alarmDate"] == alarm
 
 
 # ---------------------------------------------------------------- 精确钟点
 
 def test_defer_precise_clock_sets_exact_due(capsys, db, fake, tmp_path, monkeypatch):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
-    board(capsys, db, fake, tmp_path, monkeypatch)
+    added = seed(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "1", "今晚10点半"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", "2026-11-23", "--at", "22:30"],
+                     db=db, store=fake)
     assert code == 0
     result = data["results"][0]
     assert result["due"] == "2026-11-23" and result["at"] == "22:30"
@@ -135,7 +135,7 @@ def test_defer_precise_clock_sets_exact_due(capsys, db, fake, tmp_path, monkeypa
     sent = fake.rescheduled[-1]
     assert sent["due_at"] == datetime(2026, 11, 23, 22, 30)   # 精确到分钟
     assert sent["due"] == "2026-11-23 22:30"
-    assert sent["alarm"] == "2026-11-23 22:30"                # 与 add 同口径：到点响
+    assert sent["alarm"] == "2026-11-23 22:30"                # 到点响
     assert sent["all_day"] is False
 
     stored = item_of(fake, added["reminder_id"])
@@ -146,10 +146,9 @@ def test_defer_precise_clock_sets_exact_due(capsys, db, fake, tmp_path, monkeypa
 # ---------------------------------------------------------------- 拒绝路径
 
 def test_defer_unknown_number_is_rejected(capsys, db, fake, tmp_path, monkeypatch):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
-    board(capsys, db, fake, tmp_path, monkeypatch)
+    seed(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "99", "明天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "99", "--due", DUE], db=db, store=fake)
     assert code == 1 and data["ok"] is False
     assert data["results"][0]["ok"] is False
     assert data["results"][0]["error"] == "今天没有 99 号"
@@ -157,20 +156,19 @@ def test_defer_unknown_number_is_rejected(capsys, db, fake, tmp_path, monkeypatc
 
 
 def test_defer_without_board_asks_to_look_first(capsys, db, fake):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", DUE], db=db, store=fake)
 
-    code, data = run(capsys, ["defer", "1", "明天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", DUE], db=db, store=fake)
     assert code == 1
     assert "先看一眼看板" in data["results"][0]["error"]
     assert fake.rescheduled == []
 
 
 def test_defer_completed_item_is_rejected(capsys, db, fake, tmp_path, monkeypatch):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
-    board(capsys, db, fake, tmp_path, monkeypatch)
+    added = seed(capsys, db, fake, tmp_path, monkeypatch)
     fake.complete(added["reminder_id"])
 
-    code, data = run(capsys, ["defer", "1", "明天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", DUE], db=db, store=fake)
     assert code == 1 and "已经完成" in data["results"][0]["error"]
     assert fake.rescheduled == []
 
@@ -180,41 +178,50 @@ def test_defer_inbox_thought_points_at_clarify(capsys, db, fake,
     run(capsys, ["add", "想给家里买个加湿器"], db=db, store=fake)
     board(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "1", "明天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", DUE], db=db, store=fake)
     assert code == 1
-    assert "clarify" in data["results"][0]["error"]
+    assert f"gtd clarify 1 --due {DUE}" in data["results"][0]["error"]
     assert fake.rescheduled == []
 
 
-def test_defer_without_time_word_is_a_parameter_error(capsys, db, fake):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+def test_defer_without_due_is_a_parameter_error(capsys, db, fake):
+    seed = run(capsys, ["add", "交材料", "--due", DUE], db=db, store=fake)[1]
+    assert seed["ok"] is True
 
-    code, data = run(capsys, ["defer", "1", "交材料"], db=db, store=fake)
-    assert code == 2 and data["ok"] is False
-    assert "没从" in data["error"] and fake.rescheduled == []
+    code, data = run(capsys, ["defer", "1"], db=db, store=fake)
+    assert code == 2 and data["ok"] is False and "--due" in data["error"]
+    assert fake.rescheduled == []
+
+
+def test_defer_with_oral_time_is_a_parameter_error(capsys, db, fake):
+    run(capsys, ["add", "交材料", "--due", DUE], db=db, store=fake)
+
+    code, data = run(capsys, ["defer", "1", "--due", "明天"], db=db, store=fake)
+    assert code == 2 and "YYYY-MM-DD" in data["error"]
+    assert fake.rescheduled == []
 
 
 # ---------------------------------------------------------------- 多号 / 编号
 
 def test_defer_updates_multiple_numbers_in_one_call(capsys, db, fake,
                                                     tmp_path, monkeypatch):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
-    run(capsys, ["add", "后天下午回邮件"], db=db, store=fake)
+    seed(capsys, db, fake, tmp_path, monkeypatch)
+    run(capsys, ["add", "回邮件", "--due", "2026-11-25", "--slot", "pm"],
+        db=db, store=fake)
     assert board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1, 2]
 
-    code, data = run(capsys, ["defer", "1", "2", "明天"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "2", "--due", DUE], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert [item["seq"] for item in data["results"]] == [1, 2]
-    assert all(item["ok"] and item["due"] == TOMORROW for item in data["results"])
+    assert all(item["ok"] and item["due"] == DUE for item in data["results"])
     assert len(fake.rescheduled) == 2
-    assert {item["dueDate"] for item in fake.all()} == {TOMORROW}
+    assert {item["dueDate"] for item in fake.all()} == {DUE}
 
 
 def test_defer_keeps_the_board_number(capsys, db, fake, tmp_path, monkeypatch):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
-    board(capsys, db, fake, tmp_path, monkeypatch)
+    added = seed(capsys, db, fake, tmp_path, monkeypatch)
 
-    run(capsys, ["defer", "1", "后天"], db=db, store=fake)
+    run(capsys, ["defer", "1", "--due", NEXT_DUE], db=db, store=fake)
     assert board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     ref = BoardIndex(db).lookup(1, day=date(2026, 11, 23))
     assert ref == f"reminder:{added['reminder_id']}"
@@ -222,17 +229,18 @@ def test_defer_keeps_the_board_number(capsys, db, fake, tmp_path, monkeypatch):
 
 def test_defer_repeat_item_is_rejected(capsys, db, fake, tmp_path, monkeypatch):
     """重复任务不许 defer：改期会把 EventKit 的重复锚点一起挪走（2026-11-24 实测）。"""
-    added = run(capsys, ["add", "周一 每周 冒烟重复任务"], db=db, store=fake)[1]
-    assert added["repeat"] == "weekly"          # 「每周」才带周期，「每周一」只是星期几
+    added = run(capsys, ["add", "冒烟重复任务", "--due", "2026-11-30",
+                         "--repeat", "weekly"], db=db, store=fake)[1]
+    assert added["repeat"] == "weekly"
     board(capsys, db, fake, tmp_path, monkeypatch)
 
-    code, data = run(capsys, ["defer", "1", "明天上午"], db=db, store=fake)
+    code, data = run(capsys, ["defer", "1", "--due", "2026-12-02"], db=db, store=fake)
     assert code == 1 and data["ok"] is False
     result = data["results"][0]
     assert result["ok"] is False and "重复任务暂不支持 defer" in result["error"]
     assert fake.rescheduled == [], "重复任务一条都不许改"
     stored = item_of(fake, added["reminder_id"])
-    assert stored["repeat"] == "weekly" and stored["dueDate"] == added["due"]
+    assert stored["repeat"] == "weekly" and stored["dueDate"] == "2026-11-30"
 
 
 # ---------------------------------------------------------------- adapter

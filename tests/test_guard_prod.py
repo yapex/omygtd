@@ -1,6 +1,7 @@
 """正式库守卫（``cli._guard_prod_db``）：worker 不许默认连 ``data/gtd.db``。
 
-2026-11-23 事故回归：卡 t_84767dcd 的 worker 跑 ``gtd clarify 7 "明天下午"``，
+2026-11-23 事故回归：卡 t_84767dcd 的 worker 跑 ``gtd clarify 7``（当时是口语
+``clarify 7 "明天下午"``，口语入口现已废除）却没带 ``--db``，
 **没带 ``--db``**，直接打了正式库，把老板一条收件箱念头澄清进了 Reminder。
 本文件锁五件事：① 拦 worker（含只有 ``HERMES_KANBAN_WORKSPACE`` 的真实子 shell）
 ② ``--db`` / ``GTD_DB`` 指到别处就放行 ③ 人手动跑放行 ④ ``GTD_ALLOW_PROD=1`` 是逃生门

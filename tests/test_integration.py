@@ -121,7 +121,8 @@ def test_add_with_time_lands_in_the_test_list(tmp_path):
     """
     db = tmp_path / "gtd.db"
     title = "ZZ测试勿动跨进程临时库"
-    proc = _gtd(tmp_path, "--db", str(db), "add", f"明天中午前 {title}")
+    proc = _gtd(tmp_path, "--db", str(db), "add", title,
+                "--due", "2026-11-24", "--at", "12:00")
     assert proc.returncode == 0, proc.stderr
     data = _payload(proc)
     assert data["ok"] is True and data["list"] == TEST_LIST and data["title"] == title

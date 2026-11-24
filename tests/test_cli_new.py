@@ -74,16 +74,17 @@ def rows(db, sql, *params):
 # ---------------------------------------------------------------- add
 
 def test_add_with_time_returns_seq_list_due_at(capsys, db, fake):
-    code, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    code, data = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"],
+                     db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["seq"] == 1 and data["title"] == "交材料"
     assert data["list"] == TEST_LIST and data["due"] == "2026-11-24" and data["at"] == "12:00"
-    assert data["matched"] == "明天中午前" and data["source"] == "reminder"
+    assert data["source"] == "reminder"
     assert data["reminder_id"].startswith("fake-")
 
 
 def test_add_with_time_lands_in_store(capsys, db, fake):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     items = fake.all()
     assert [item["title"] for item in items] == ["交材料"]
     assert items[0]["listName"] == TEST_LIST
@@ -102,7 +103,7 @@ def test_add_without_time_goes_to_inbox(capsys, db, fake):
 
 def test_add_reminder_failure_keeps_thought_in_inbox(capsys, db, no_guard):
     broken = BrokenStore(lists=("GTD", "Waiting"))
-    code, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=broken)
+    code, data = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=broken)
     assert code == 1 and data["ok"] is False
     assert "Reminder" in data["error"]
     rows_in_inbox = Inbox(db).pending()
@@ -123,7 +124,7 @@ def test_injected_store_skips_real_adapter(capsys, db, fake, monkeypatch):
     def boom(*_args, **_kwargs):
         raise AssertionError("注入 store 时不许构造真实 adapter")
     monkeypatch.setattr(cli, "RemindctlAdapter", boom)
-    code, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    code, data = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
 
 
@@ -150,7 +151,7 @@ def test_inbox_lists_pending_with_oldest_days(capsys, db, fake):
 def test_clarify_marks_inbox_row_moved(capsys, db, fake):
     run(capsys, ["add", "回设计稿"], db=db, store=fake)
     inbox_id = Inbox(db).pending()[0]["id"]
-    code, data = run(capsys, ["clarify", str(inbox_id), "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", str(inbox_id), "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["title"] == "回设计稿"                  # 只说了时间，标题沿用 inbox 的
     # 下午 = 全天 + 18:00 响（t_0541f6c3）：at 不再报 18:00，改报 slot
@@ -163,11 +164,12 @@ def test_clarify_marks_inbox_row_moved(capsys, db, fake):
     assert fake.all()[0]["isCompleted"] is False
 
 
-def test_clarify_without_time_fails_and_keeps_inbox(capsys, db, fake):
+def test_clarify_without_due_is_a_parameter_error(capsys, db, fake):
+    """不给 --due 是参数错（退出码 2）：念头一条都不许动。"""
     run(capsys, ["add", "回设计稿"], db=db, store=fake)
     inbox_id = Inbox(db).pending()[0]["id"]
-    code, data = run(capsys, ["clarify", str(inbox_id), "就是那个事"], db=db, store=fake)
-    assert code == 1 and data["ok"] is False and data["error"] == "没听出时间"
+    code, data = run(capsys, ["clarify", str(inbox_id)], db=db, store=fake)
+    assert code == 2 and data["ok"] is False and "--due" in data["error"]
     assert len(Inbox(db).pending()) == 1
     assert rows(db, "select moved_at from inbox where id=?", inbox_id)[0]["moved_at"] is None
     assert fake.all() == []
@@ -177,7 +179,7 @@ def test_clarify_reminder_failure_keeps_inbox_untouched(capsys, db, no_guard):
     broken = BrokenStore(lists=("GTD", "Waiting"))
     run(capsys, ["add", "回设计稿"], db=db, store=broken)
     inbox_id = Inbox(db).pending()[0]["id"]
-    code, data = run(capsys, ["clarify", str(inbox_id), "明天下午"], db=db, store=broken)
+    code, data = run(capsys, ["clarify", str(inbox_id), "--due", "2026-11-24", "--slot", "pm"], db=db, store=broken)
     assert code == 1 and data["ok"] is False and data["inbox_id"] == inbox_id
     assert len(Inbox(db).pending()) == 1
     assert rows(db, "select moved_at from inbox where id=?", inbox_id)[0]["moved_at"] is None
@@ -185,31 +187,31 @@ def test_clarify_reminder_failure_keeps_inbox_untouched(capsys, db, no_guard):
 
 def test_clarify_accepts_the_number_seen_on_the_board(capsys, db, fake):
     """老板看到的是当日序号：先占一个号给 Reminder，再记一条念头（id=1、号=2）。"""
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)     # 号 1
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)     # 号 1
     _, parked = run(capsys, ["add", "回设计稿"], db=db, store=fake)  # 号 2，inbox id 1
     assert parked["seq"] == 2 and parked["inbox_id"] == 1
-    code, data = run(capsys, ["clarify", "2", "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", "2", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0 and data["ok"] is True and data["inbox_id"] == 1
     assert [row["title"] for row in Inbox(db).pending()] == []
 
 
 def test_clarify_rejects_a_number_taken_by_a_reminder(capsys, db, fake):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)      # 号 1 = reminder
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)      # 号 1 = reminder
     run(capsys, ["add", "回设计稿"], db=db, store=fake)              # 号 2 = inbox id 1
-    code, data = run(capsys, ["clarify", "1", "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", "1", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 1 and data["ok"] is False
     assert len(Inbox(db).pending()) == 1            # 别错迁了别的念头
 
 
 def test_clarify_falls_back_to_inbox_row_id(capsys, db, fake):
     row_id = Inbox(db).add("没有号的念头", now=datetime(2026, 11, 23, 8, 0))
-    code, data = run(capsys, ["clarify", str(row_id), "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", str(row_id), "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0 and data["inbox_id"] == row_id
     assert Inbox(db).pending() == []
 
 
 def test_clarify_unknown_id_reports_error(capsys, db, fake):
-    code, data = run(capsys, ["clarify", "42", "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", "42", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 1 and data["ok"] is False and "没有 #42" in data["error"]
     assert fake.all() == []
 
@@ -227,7 +229,7 @@ def fake_board(capsys, db, store, tmp_path, monkeypatch) -> dict:
 
 
 def test_done_completes_the_number_on_the_board(capsys, db, fake, tmp_path, monkeypatch):
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
+    added = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)[1]
     assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1]
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
@@ -237,8 +239,8 @@ def test_done_completes_the_number_on_the_board(capsys, db, fake, tmp_path, monk
 
 
 def test_done_completes_multiple_numbers(capsys, db, fake, tmp_path, monkeypatch):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
-    run(capsys, ["add", "后天下午回邮件"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
+    run(capsys, ["add", "回邮件", "--due", "2026-11-25", "--slot", "pm"], db=db, store=fake)
     assert fake_board(capsys, db, fake, tmp_path, monkeypatch)["numbers"] == [1, 2]
     code, data = run(capsys, ["done", "1", "2"], db=db, store=fake)
     assert code == 0 and [item["seq"] for item in data["results"]] == [1, 2]
@@ -248,7 +250,7 @@ def test_done_completes_multiple_numbers(capsys, db, fake, tmp_path, monkeypatch
 
 def test_done_without_board_says_take_a_look_first(capsys, db, fake):
     """今天还没出过图 → 不许按 daily_seq 瞎猜，直接让人先看图。"""
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 1 and data["results"][0]["ok"] is False
     assert "先看一眼看板" in data["results"][0]["error"]
@@ -257,7 +259,7 @@ def test_done_without_board_says_take_a_look_first(capsys, db, fake):
 
 def test_done_unknown_number_reports_error_without_crashing(capsys, db, fake,
                                                             tmp_path, monkeypatch):
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     code, data = run(capsys, ["done", "99"], db=db, store=fake)
     assert code == 1 and data["ok"] is False
@@ -279,7 +281,7 @@ def test_done_on_already_clarified_inbox_number_says_where_to_look(capsys, db, f
     run(capsys, ["add", "想到一个点子"], db=db, store=fake)
     row_id = Inbox(db).pending()[0]["id"]
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
-    run(capsys, ["clarify", "1", "明天下午"], db=db, store=fake)
+    run(capsys, ["clarify", "1", "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
     assert code == 1 and data["results"][0]["ok"] is False
     assert data["results"][0]["ref"] == f"inbox:{row_id}"
@@ -289,7 +291,7 @@ def test_done_on_already_clarified_inbox_number_says_where_to_look(capsys, db, f
 def test_done_refuses_when_reminder_completed_on_phone(capsys, db, fake, tmp_path,
                                                        monkeypatch):
     """图上出完之后在手机上完成了这条：号还在，但不能再做一次。"""
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     fake_board(capsys, db, fake, tmp_path, monkeypatch)
     fake.complete(fake.all()[0]["id"])
     code, data = run(capsys, ["done", "1"], db=db, store=fake)
@@ -406,7 +408,7 @@ def test_board_drops_deleted_numbers_without_renumbering(capsys, db, fake, out_d
 
 def test_board_leaves_daily_seq_alone(capsys, db, fake, out_dir, monkeypatch):
     """图上号与 daily_seq 是两套：出图不许改 daily_seq 一行。"""
-    run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     before = rows(db, "select day, seq, ref from daily_seq order by seq")
     monkeypatch.setattr(cli.render, "render_today", counting_render())
     run(capsys, ["board"], db=db, store=fake)
@@ -588,13 +590,14 @@ def test_board_creates_missing_out_dir(capsys, db, fake, tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- 注入与退出码
 
-def test_now_injection_works_across_midnight(capsys, db, fake):
-    _, late = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake,
+def test_now_injection_decides_the_day_of_the_number(capsys, db, fake):
+    """--now 决定「今天」（当日序号按它算）；到期日由 --due 显式给，不随午夜漂。"""
+    _, late = run(capsys, ["add", "交材料", "--due", "2026-11-24"], db=db, store=fake,
                   now="2026-11-23 23:59")
     assert late["due"] == "2026-11-24" and late["seq"] == 1
-    _, early = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake,
+    _, early = run(capsys, ["add", "交材料", "--due", "2026-11-24"], db=db, store=fake,
                    now="2026-11-24 00:01")
-    assert early["due"] == "2026-11-25" and early["seq"] == 1
+    assert early["due"] == "2026-11-24" and early["seq"] == 1
 
 
 def test_unknown_command_exits_2(capsys, db, fake):
@@ -610,7 +613,7 @@ def test_missing_argument_exits_2(capsys, db, fake):
 
 
 def test_human_output_is_not_json(capsys, db, fake):
-    code = cli.main(["--db", str(db), "--now", NOW, "--human", "add", "明天中午前交材料"],
+    code = cli.main(["--db", str(db), "--now", NOW, "--human", "add", "交材料", "--due", "2026-11-24", "--at", "12:00"],
                     store=fake)
     out = capsys.readouterr().out.strip()
     assert code == 0
@@ -619,11 +622,12 @@ def test_human_output_is_not_json(capsys, db, fake):
 
 def test_human_output_names_all_day_and_slots(capsys, db, fake):
     """--human 回执用「全天 / 上午 / 下午」同一个词，不印 00:00。"""
-    for text, expected in (("明天 买菜", "· 2026-11-24 全天"),
-                           ("明天上午买菜", "· 2026-11-24 上午"),
-                           ("明天下午买菜", "· 2026-11-24 下午")):
-        cli.main(["--db", str(db), "--now", NOW, "--human", "add", text], store=fake)
-        assert capsys.readouterr().out.strip().endswith(expected), text
+    cases = ((["买菜", "--due", "2026-11-24"], "· 2026-11-24 全天"),
+             (["买菜", "--due", "2026-11-24", "--slot", "am"], "· 2026-11-24 上午"),
+             (["买菜", "--due", "2026-11-24", "--slot", "pm"], "· 2026-11-24 下午"))
+    for argv, expected in cases:
+        cli.main(["--db", str(db), "--now", NOW, "--human", "add", *argv], store=fake)
+        assert capsys.readouterr().out.strip().endswith(expected), argv
 
 
 def test_list_counts_per_list(capsys, db, fake):
@@ -642,7 +646,7 @@ def test_list_counts_per_list(capsys, db, fake):
 
 def test_add_date_only_lands_as_all_day(capsys, db, fake):
     """只给日期 → Reminder 全天（due 不带时刻、无闹钟）。"""
-    code, data = run(capsys, ["add", "明天 买菜"], db=db, store=fake)
+    code, data = run(capsys, ["add", "买菜", "--due", "2026-11-24"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["due"] == "2026-11-24" and data["at"] is None
     assert data["all_day"] is True and data["slot"] is None
@@ -652,15 +656,15 @@ def test_add_date_only_lands_as_all_day(capsys, db, fake):
 
 
 def test_add_morning_slot_is_all_day_plus_noon_alarm(capsys, db, fake):
-    code, data = run(capsys, ["add", "明天上午买菜"], db=db, store=fake)
-    assert data["at"] is None and data["all_day"] is False and data["slot"] == "am"
+    code, data = run(capsys, ["add", "买菜", "--due", "2026-11-24", "--slot", "am"], db=db, store=fake)
+    assert data["at"] is None and data["all_day"] is True and data["slot"] == "am"
     (item,) = fake.all()
     assert item["dueDate"] == "2026-11-24" and item["dueDateIsAllDay"] is True
     assert item["alarmDate"] == "2026-11-24 12:00"
 
 
 def test_add_afternoon_slot_is_all_day_plus_evening_alarm(capsys, db, fake):
-    code, data = run(capsys, ["add", "后天下午开会"], db=db, store=fake)
+    code, data = run(capsys, ["add", "开会", "--due", "2026-11-25", "--slot", "pm"], db=db, store=fake)
     assert data["slot"] == "pm" and data["due"] == "2026-11-25"
     (item,) = fake.all()
     assert item["dueDate"] == "2026-11-25" and item["dueDateIsAllDay"] is True
@@ -669,7 +673,7 @@ def test_add_afternoon_slot_is_all_day_plus_evening_alarm(capsys, db, fake):
 
 def test_add_precise_time_rings_at_that_moment(capsys, db, fake):
     """今晚 22:30 → due 与 alarm 都是 22:30（到点响一次，不再是「没闹钟」）。"""
-    code, data = run(capsys, ["add", "今晚 22:30 卖出"], db=db, store=fake)
+    code, data = run(capsys, ["add", "卖出", "--due", "2026-11-23", "--at", "22:30"], db=db, store=fake)
     assert data["at"] == "22:30" and data["all_day"] is False and data["slot"] is None
     (item,) = fake.all()
     assert item["dueDate"] == "2026-11-23 22:30"
@@ -730,7 +734,7 @@ def test_view_numbers_match_board_numbers(capsys, db, fake, tmp_path, monkeypatc
 
 def test_view_writes_board_index_so_done_still_works(capsys, db, fake):
     """只看了 Markdown（没出图）也能按号完成——view 成功后就写了 board_index。"""
-    added = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)[1]
+    added = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)[1]
     code, text = run_text(capsys, ["view"], db=db, store=fake)
     assert code == 0 and md_numbers(text) == [1]
     assert board_rows(db) == [(1, f"reminder:{added['reminder_id']}")]
@@ -780,21 +784,24 @@ def test_human_list_prints_text_not_json(capsys, db, fake):
 # 老板要的是「和 Reminder 里一致的重要级」：命令词汇照抄 remindctl
 # （none|low|medium|high），只改收件箱条目——今天区/接下来区按日期排，不受影响。
 
-def test_add_recognises_importance_and_strips_the_word(capsys, db, fake):
-    code, data = run(capsys, ["add", "对腾讯Q3财报做综合分析，这个很重要"], db=db, store=fake)
+def test_add_priority_flag_is_the_only_way_to_set_a_level(capsys, db, fake):
+    """「很重要」不再被识别：标题原样留着，档位只认 --priority。"""
+    code, data = run(capsys, ["add", "对腾讯Q3财报做综合分析，这个很重要",
+                              "--priority", "high"], db=db, store=fake)
     assert code == 0 and data["priority"] == "high"
-    assert data["title"] == "对腾讯Q3财报做综合分析" and "重要" not in data["title"]
+    assert data["title"] == "对腾讯Q3财报做综合分析，这个很重要"
     assert Inbox(db).pending()[0]["priority"] == "high"
 
 
-def test_add_priority_flag_overrides_parser(capsys, db, fake):
+def test_add_priority_flag_sets_low(capsys, db, fake):
     _, data = run(capsys, ["add", "买鸡蛋", "--priority", "low"], db=db, store=fake)
     assert data["priority"] == "low"
     assert Inbox(db).pending()[0]["priority"] == "low"
 
 
 def test_add_timed_task_writes_priority_into_reminder(capsys, db, fake):
-    _, data = run(capsys, ["add", "明天中午前交材料，很重要"], db=db, store=fake)
+    _, data = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00",
+                           "--priority", "high"], db=db, store=fake)
     assert data["source"] == "reminder" and data["priority"] == "high"
     assert fake.all()[0]["priority"] == "high"
 
@@ -942,9 +949,9 @@ def test_priority_keeps_board_numbers_stable_across_views(capsys, db, fake,
 
 
 def test_clarify_carries_inbox_priority_into_reminder(capsys, db, fake):
-    run(capsys, ["add", "对腾讯Q3财报做综合分析，这个很重要"], db=db, store=fake)
+    run(capsys, ["add", "对腾讯Q3财报做综合分析", "--priority", "high"], db=db, store=fake)
     row_id = Inbox(db).pending()[0]["id"]
-    code, data = run(capsys, ["clarify", str(row_id), "明天下午"], db=db, store=fake)
+    code, data = run(capsys, ["clarify", str(row_id), "--due", "2026-11-24", "--slot", "pm"], db=db, store=fake)
     assert code == 0 and data["priority"] == "high"
     assert fake.all()[0]["priority"] == "high", "clarify 之后 Reminder 里也要带 high"
 
@@ -953,8 +960,8 @@ def test_clarify_carries_inbox_priority_into_reminder(capsys, db, fake):
 # ---------------------------------------------------------------- 周期（repeat）
 
 def test_add_repeat_lands_in_store_and_payload(capsys, db, fake):
-    """「每 5 天 拼多多领券」：载荷有 repeat、Reminder 里也有、due 是今天 +5。"""
-    code, data = run(capsys, ["add", "每 5 天 拼多多领券"], db=db, store=fake)
+    """``--due`` 是锚点，``--repeat daily --repeat-interval 5`` → 每 5 天。"""
+    code, data = run(capsys, ["add", "拼多多领券", "--due", "2026-11-28", "--repeat", "daily", "--repeat-interval", "5"], db=db, store=fake)
     assert code == 0 and data["ok"] is True
     assert data["repeat"] == "every 5 days"
     assert data["title"] == "拼多多领券"
@@ -965,14 +972,14 @@ def test_add_repeat_lands_in_store_and_payload(capsys, db, fake):
 
 def test_add_one_off_task_has_no_repeat(capsys, db, fake):
     """一次性任务：载荷 repeat 为 None，Reminder 里也不许带周期。"""
-    _, data = run(capsys, ["add", "明天中午前交材料"], db=db, store=fake)
+    _, data = run(capsys, ["add", "交材料", "--due", "2026-11-24", "--at", "12:00"], db=db, store=fake)
     assert data["repeat"] is None
     assert fake.all()[0]["repeat"] == ""
 
 
 def test_add_repeat_keeps_alarm_like_a_normal_task(capsys, db, fake):
     """有周期的任务跟普通任务一样：有时刻就到点响，周期不吞闹钟。"""
-    _, data = run(capsys, ["add", "15:00 每 5 天 领券"], db=db, store=fake)
+    _, data = run(capsys, ["add", "领券", "--due", "2026-11-28", "--at", "15:00", "--repeat", "daily", "--repeat-interval", "5"], db=db, store=fake)
     item = fake.all()[0]
     assert data["repeat"] == "every 5 days"
     assert data["at"] == "15:00"
@@ -981,14 +988,15 @@ def test_add_repeat_keeps_alarm_like_a_normal_task(capsys, db, fake):
 
 def test_human_receipt_shows_cycle(capsys, db, fake):
     """--human 回执也带「（每 5 天）」，秘书转述时不用再查 JSON。"""
-    code, text = run_text(capsys, ["--human", "add", "每 5 天 拼多多领券"], db=db, store=fake)
+    code, text = run_text(capsys, ["--human", "add", "拼多多领券", "--due", "2026-11-28", "--repeat", "daily",
+                          "--repeat-interval", "5"], db=db, store=fake)
     assert code == 0
     assert "拼多多领券（每 5 天）" in text
 
 
 def test_view_shows_repeat_marker(capsys, db, fake):
     """gtd view 里能看到周期标记（标题后括注）。"""
-    run(capsys, ["add", "每 5 天 拼多多领券"], db=db, store=fake)
+    run(capsys, ["add", "拼多多领券", "--due", "2026-11-28", "--repeat", "daily", "--repeat-interval", "5"], db=db, store=fake)
     code, text = run_text(capsys, ["view"], db=db, store=fake)
     assert code == 0
     assert "拼多多领券（每 5 天）" in text

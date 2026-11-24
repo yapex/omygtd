@@ -181,7 +181,7 @@ class ExplodingStore(FakeStore):
 
 
 def test_lock_is_released_when_the_command_raises(db, no_guard):
-    code = run(["add", "明天 9 点开会"],
+    code = run(["add", "开会", "--due", "2026-11-24", "--at", "09:00"],
                db=db, store=ExplodingStore(lists=("GTD", "Waiting")))
     assert code == 1
     with lock.write_lock(db, timeout=0.5):        # 拿不到就是没释放

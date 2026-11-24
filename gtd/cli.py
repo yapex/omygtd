@@ -30,13 +30,13 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from . import (__version__, audit, doctor, lock, parser as nlp, priority as prio,
-               repeat as rep, render)
+from . import (__version__, audit, doctor, lock, priority as prio, repeat as rep,
+               render, timeutil)
 from .inbox import DEFAULT_DB, PROJECT_ROOT, BoardIndex, Inbox, Mirror, Seq
 from .reminders import TEST_LIST, RemindctlAdapter, ReminderStore
 
 EXIT_OK, EXIT_FAIL, EXIT_PARAM = 0, 1, 2
-LISTS = (nlp.LIST_DEFAULT, nlp.LIST_WAITING)
+LISTS = timeutil.LISTS
 OUT_ENV = "GTD_OUT"
 ALLOW_PROD_ENV = "GTD_ALLOW_PROD"           # 显式逃生门：worker 确实要动正式库时设 1
 # worker 判据：看板卡进程的标记变量（dispatcher 注入）。实测 2026-11-23：
@@ -57,22 +57,75 @@ class Result:
     audit: dict | None = None          # 审计材料（parsed / before / after），main 负责落盘
 
 
+class ParamError(ValueError):
+    """参数错（口语日期 / 非法钟点 / 旗标组合不对）→ 退出码 2，不是业务失败。"""
+
+
+def _check_args(args) -> None:
+    """写命令的严格入参校验：只认 ISO 日期与 24 小时钟点，口语一律拒。"""
+    if args.command not in ("add", "defer", "clarify"):
+        return
+    _when_of(args)
+    _check_repeat(args)
+
+
+def _check_repeat(args) -> None:
+    """``--repeat`` / ``--repeat-interval``：只有 add 有这两个旗标。"""
+    if args.command != "add":
+        return
+    interval = args.repeat_interval
+    if args.repeat is None:
+        if interval != 1:
+            raise ParamError("--repeat-interval 要和 --repeat 一起用"
+                             "（例：--repeat weekly --repeat-interval 2）")
+        return
+    if interval < 1:
+        raise ParamError(f"--repeat-interval 必须是正整数，收到「{interval}」"
+                         "（例：--repeat weekly --repeat-interval 2）")
+
+
+def _when_of(args) -> timeutil.When:
+    """``--due`` / ``--at`` / ``--slot`` → When；非法组合抛 ParamError（文案带示例）。"""
+    try:
+        due = timeutil.parse_date(args.due) if args.due is not None else None
+        at = timeutil.parse_clock(args.at) if args.at is not None else None
+    except ValueError as exc:
+        raise ParamError(str(exc)) from None
+    slot = getattr(args, "slot", None)
+    if at is not None and slot is not None:
+        raise ParamError("--at 与 --slot 互斥：要具体钟点用 --at 09:30，"
+                         "要上午/下午用 --slot am|pm（例：--due 2026-12-01 --at 09:30）")
+    if due is None and (at is not None or slot is not None):
+        raise ParamError("--at / --slot 需要 --due 一起给"
+                         "（例：--due 2026-12-01 --at 09:30）")
+    if due is None and args.command != "add":
+        raise ParamError(f"{args.command} 必须给 --due YYYY-MM-DD（例：--due 2026-12-01）")
+    if due is None and getattr(args, "repeat", None):
+        raise ParamError("--repeat 需要 --due 指定锚点那一天"
+                         "（例：--due 2026-11-30 --repeat weekly）")
+    return timeutil.When(due=due, at=at, slot=slot)
+
+
+def _spec(title: str, when: timeutil.When, level, cycle) -> dict:
+    """审计与回执共用的入参口径（不再有「解析结果」这一层）。"""
+    return {"title": title, **when.audit(),
+            "priority": prio.normalize(level), "repeat": cycle}
+
+
 def is_prod_db(db) -> bool:
     """这次写的是不是正式库 ``data/gtd.db``（其余路径一律当临时/测试库）。"""
     return Path(db or ":memory:").resolve() == Path(DEFAULT_DB).resolve()
 
 
-def target_list(db, parsed=None) -> str:
-    """写 Reminder 用哪张列表：**非正式库一律 GTD_TEST**（测试隔离），正式库按解析结果。
+def target_list(db) -> str:
+    """写 Reminder 用哪张列表：**非正式库一律 GTD_TEST**（测试隔离），正式库写 GTD。
 
     老板 2026-11-23 定的规矩：临时库 / 测试库写来的任务不许混进真实 ``GTD``。
-    原来靠人记「测试记得带 --db / 写 GTD_TEST」，worker 一不知道建列表就绕去写 GTD，
-    所以改成按 db 路径硬判（这里一处决定，add / clarify 都走它）。
+    列表不再从话里解析，所以只按 db 路径判（这里一处决定，add / clarify 都走它）。
     """
     if not is_prod_db(db):
         return TEST_LIST
-    picked = getattr(parsed, "list", None)
-    return picked if picked in LISTS else nlp.LIST_DEFAULT
+    return timeutil.LIST_DEFAULT
 
 
 @dataclass
@@ -111,6 +164,13 @@ def main(argv=None, *, store: ReminderStore | None = None, now=None) -> int:
     except SystemExit as exc:          # argparse：未知命令、缺参数 → 2；--help → 0
         return int(exc.code or 0)
     try:
+        _check_args(args)               # 严格入参：口语 / 非法值一律拒（退出码 2）
+    except ParamError as exc:
+        payload = {"ok": False, "error": str(exc)}
+        _audit(args, raw, None, EXIT_PARAM, payload)
+        _write(payload, args.human, args.command)
+        return EXIT_PARAM
+    try:
         _guard_prod_db(args)            # worker 默认连正式库 → 先拒，别等开了库才发现
         with _write_lock(args, raw):
             ctx = _context(args, store, now)
@@ -146,7 +206,7 @@ def _in_kanban_worker() -> bool:
 def _guard_prod_db(args) -> None:
     """禁止 worker 默认连正式库——它做端到端测试会把老板的真实数据写脏。
 
-    2026-11-23 事故：卡 t_84767dcd 的 worker 跑 ``gtd clarify 7 "明天下午"`` 没带
+    2026-11-23 事故：卡 t_84767dcd 的 worker 跑 ``gtd clarify 7 --due 2026-12-01`` 没带
     ``--db``，直接澄清了老板真库里的一条念头。只拦**写**命令（``lock.WRITE_COMMANDS``）；
     ``view`` / ``board`` / ``list`` / ``doctor`` 对正式库只读，照旧放行。
     """
@@ -236,27 +296,9 @@ def _hhmm(moment: datetime) -> str:
     return moment.strftime("%H:%M")
 
 
-def _list_of(ctx: Context, parsed) -> str:
+def _list_of(ctx: Context) -> str:
     """这次写哪张列表：跟着库走（临时库 → GTD_TEST），不看人记不记得。"""
-    return target_list(ctx.db, parsed)
-
-
-def _due_at(parsed, now: datetime) -> datetime | None:
-    """解析结果 → Reminder 的到期时刻；只有日期时落当天零点（全天由标记决定）。
-
-    全天 / 时段的「没有钟点」不是 22:30：`parsed.all_day` / `parsed.slot` 直接传给
-    存储层，这里只给日期占位。什么时间都没听出来 → None（进收件箱）。
-    """
-    if parsed.due is None and parsed.at is None:
-        return None
-    return datetime.combine(parsed.due or now.date(), parsed.at or time(0, 0))
-
-
-def _advance(parsed) -> int | None:
-    """闹钟提前量：具体时刻默认到点即响（0），「提前X」优先；全天/时段交给存储层。"""
-    if parsed.at is None:
-        return parsed.advance_minutes
-    return parsed.advance_minutes if parsed.advance_minutes is not None else 0
+    return target_list(ctx.db)
 
 
 def _ensure_lists(ctx: Context) -> None:
@@ -326,25 +368,14 @@ AUDIT_KEYS = ("source", "seq", "inbox_id", "reminder_id", "number", "ref", "prio
               "previous", "unchanged", "due", "at", "all_day", "slot", "results")
 
 
-def _audited(result: Result, parsed=None, before=None, after=None) -> Result:
-    """给回执挂上审计三问（parsed / before / after）；after 不给就取回执里的状态。"""
+def _audited(result: Result, spec=None, before=None, after=None) -> Result:
+    """给回执挂上审计三问（入参口径 / before / after）；after 不给就取回执里的状态。"""
     result.audit = {
-        "parsed": _parsed_audit(parsed) if parsed is not None else None,
+        "parsed": spec,
         "before": before,
         "after": after if after is not None else _after(result.payload),
     }
     return result
-
-
-def _parsed_audit(parsed) -> dict:
-    """解析结果原样进日志：以后「它为什么以为我说了明天下午」不用重放。"""
-    return {"title": parsed.title,
-            "due": parsed.due.isoformat() if parsed.due else None,
-            "at": parsed.at.strftime("%H:%M") if parsed.at else None,
-            "all_day": parsed.all_day, "slot": parsed.slot,
-            "priority": prio.normalize(parsed.priority), "repeat": parsed.repeat,
-            "list": parsed.list, "advance_minutes": parsed.advance_minutes,
-            "matched": parsed.matched}
 
 
 def _after(payload: dict) -> dict:
@@ -388,51 +419,53 @@ def _unique_out(stamp: datetime) -> Path:
 # ---------------------------------------------------------------- add
 
 def cmd_add(ctx: Context, args) -> Result:
-    """有时间进 Reminder，没时间进 inbox；Reminder 失败就留在 inbox。"""
-    parsed = nlp.parse(args.text, now=ctx.now)
-    level = args.priority or parsed.priority          # 命令行 --priority 覆盖解析结果
-    due_at = _due_at(parsed, ctx.now)
-    if due_at is None:
-        return _audited(_park(ctx, parsed, args.note, level=level), parsed)
+    """严格入参：时间只认 --due / --at / --slot；没给 --due 就进收件箱。
+
+    标题**原样入库**，不做任何词剥离（「明天买菜」就是一条叫「明天买菜」的念头）。
+    给了 --due：只日期 → 全天无闹钟；--slot → 全天 + 12:00/18:00 闹钟；
+    --at → due 就是那一刻（到点响）。--repeat 的锚点就是 --due 那天。
+    """
+    when = _when_of(args)
+    level = prio.normalize(args.priority)
+    cycle = rep.spec(args.repeat, args.repeat_interval) if args.repeat else None
+    spec = _spec(args.text, when, level, cycle)
+    if when.due is None:
+        return _audited(_park(ctx, args.text, when, args.note,
+                              level=level, cycle=cycle), spec)
     _ensure_lists(ctx)
-    reminder_id = ctx.store.add(parsed.title, due_at, _list_of(ctx, parsed),
-                                advance_minutes=_advance(parsed),
-                                note=args.note,
-                                all_day=parsed.all_day, slot=parsed.slot,
-                                priority=level, repeat=parsed.repeat)
+    reminder_id = ctx.store.add(args.text, when.moment, _list_of(ctx),
+                                advance_minutes=when.advance_minutes, note=args.note,
+                                all_day=when.all_day, slot=when.slot,
+                                priority=level, repeat=cycle)
     if not reminder_id:
-        return _audited(_park(ctx, parsed, args.note, due_at=due_at, level=level,
-                              error="Reminder 写不进去，已留在收件箱"), parsed)
-    return _audited(Result(_landed(ctx, parsed, reminder_id, due_at, level=level)), parsed)
+        return _audited(_park(ctx, args.text, when, args.note, level=level, cycle=cycle,
+                              error="Reminder 写不进去，已留在收件箱"), spec)
+    return _audited(Result(_landed(ctx, args.text, reminder_id, when, level, cycle)), spec)
 
 
-def _landed(ctx: Context, parsed, reminder_id: str, due_at: datetime, title=None,
-            level=None) -> dict:
+def _landed(ctx: Context, title: str, reminder_id: str, when: timeutil.When,
+            level=None, cycle=None) -> dict:
     """写成功后的回执：``at`` 只报具体时刻，全天/时段另给标记（别把 00:00 当时刻）。"""
     return {"ok": True, "seq": _seq_of(ctx, f"reminder:{reminder_id}"),
-            "title": title or parsed.title, "list": _list_of(ctx, parsed),
-            "due": due_at.date().isoformat(),
-            "at": _hhmm(due_at) if parsed.at is not None else None,
-            "all_day": parsed.all_day, "slot": parsed.slot,
-            "priority": prio.normalize(level or parsed.priority),
-            "repeat": parsed.repeat,
-            "reminder_id": reminder_id, "matched": parsed.matched,
-            "source": "reminder"}
+            "title": title, "list": _list_of(ctx),
+            "due": when.due.isoformat(),
+            "at": _hhmm(when.moment) if when.at is not None else None,
+            "all_day": when.all_day, "slot": when.slot,
+            "priority": prio.normalize(level), "repeat": cycle,
+            "reminder_id": reminder_id, "source": "reminder"}
 
 
-def _park(ctx: Context, parsed, note, error: str | None = None,
-          due_at: datetime | None = None, level=None) -> Result:
+def _park(ctx: Context, title: str, when: timeutil.When, note,
+          error: str | None = None, level=None, cycle=None) -> Result:
     """念头落 inbox（不丢），迁出标记留给 clarify / done。"""
-    level = prio.normalize(level or parsed.priority)
-    inbox_id = ctx.inbox.add(parsed.title, note or "", now=ctx.now, priority=level)
+    level = prio.normalize(level)
+    inbox_id = ctx.inbox.add(title, note or "", now=ctx.now, priority=level)
     payload = {"ok": error is None, "seq": _seq_of(ctx, f"inbox:{inbox_id}"),
-               "title": parsed.title, "list": None, "source": "inbox",
-               "due": due_at.date().isoformat() if due_at else None,
-               "at": _hhmm(due_at) if due_at and parsed.at is not None else None,
-               "all_day": parsed.all_day, "slot": parsed.slot,
-               "priority": level,
-               "repeat": parsed.repeat,
-               "inbox_id": inbox_id, "matched": parsed.matched}
+               "title": title, "list": None, "source": "inbox",
+               "due": when.due.isoformat() if when.due else None,
+               "at": _hhmm(when.moment) if when.at is not None else None,
+               "all_day": when.all_day, "slot": when.slot,
+               "priority": level, "repeat": cycle, "inbox_id": inbox_id}
     if error:
         payload["error"] = error
     return Result(payload, code=EXIT_OK if error is None else EXIT_FAIL)
@@ -456,41 +489,39 @@ def cmd_inbox(ctx: Context, _args) -> Result:
 # ---------------------------------------------------------------- clarify
 
 def cmd_clarify(ctx: Context, args) -> Result:
-    """给 inbox 里的念头补时间：Reminder 成功才打迁出标记。"""
+    """给 inbox 里的念头补时间：Reminder 成功才打迁出标记。
+
+    时间由调用方换算好，用 --due / --at / --slot 传进来；标题沿用 inbox 那一行。
+    """
     row = _pending_row(ctx, args.number)
     if row is None:
         return _audited(Result({"ok": False,
                                 "error": f"收件箱里没有 #{args.number}"
                                          f"（可能已定时间，或者号不存在）"},
                                code=EXIT_FAIL), before={"number": args.number})
-    parsed = nlp.parse(args.text, now=ctx.now)
+    when = _when_of(args)
     before = _inbox_snapshot(row)
-    due_at = _due_at(parsed, ctx.now)
-    if due_at is None:
-        return _audited(Result({"ok": False, "error": "没听出时间", "inbox_id": row["id"]},
-                               code=EXIT_FAIL), parsed, before)
-    title = parsed.title or row["title"]
-    level = parsed.priority if prio.is_set(parsed.priority) else prio.normalize(row.get("priority"))
+    title, level = row["title"], prio.normalize(row.get("priority"))
+    spec = _spec(title, when, level, None)
     _ensure_lists(ctx)
-    reminder_id = ctx.store.add(title, due_at, _list_of(ctx, parsed),
-                                advance_minutes=_advance(parsed),
-                                note=row["note"],
-                                all_day=parsed.all_day, slot=parsed.slot,
-                                priority=level, repeat=parsed.repeat)
+    reminder_id = ctx.store.add(title, when.moment, _list_of(ctx),
+                                advance_minutes=when.advance_minutes,
+                                note=row["note"], all_day=when.all_day,
+                                slot=when.slot, priority=level, repeat=None)
     if not reminder_id:
         return _audited(Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
-                                "inbox_id": row["id"]}, code=EXIT_FAIL), parsed, before)
+                                "inbox_id": row["id"]}, code=EXIT_FAIL), spec, before)
     ctx.inbox.mark_moved(row["id"], reminder_id, now=ctx.now)
-    payload = _landed(ctx, parsed, reminder_id, due_at, title=title, level=level)
+    payload = _landed(ctx, title, reminder_id, when, level, None)
     payload["inbox_id"] = row["id"]
     after = _inbox_snapshot(ctx.inbox.get(row["id"]))
-    return _audited(Result(payload), parsed, before, after=after)
+    return _audited(Result(payload), spec, before, after=after)
 
 
 def _pending_row(ctx: Context, number: int) -> dict | None:
     """按「老板看到的号」找：先看当日序号（board / inbox 上印的号），再退回 inbox 行 id。
 
-    日常路径是序号——老板在图上看到 3，就说「3 明天上午」。行 id 是兜底：
+    日常路径是序号：老板在图上看到 3，就说「3 ...」。行 id 是兜底：
     还没拿到号的念头（seq 为空）也能直接按 id 澄清。
     """
     ref = ctx.seq.lookup(number, day=ctx.today)
@@ -916,9 +947,9 @@ def _repeat_problem(ctx: Context, reminder_id: str) -> str | None:
 def cmd_defer(ctx: Context, args) -> Result:
     """按**图上的号**改到期时间：改期，不是完成，也不重建条目。
 
-    时间词走 ``parser.parse``（与 add 同一套）：只给日期 → 全天、无闹钟；
-    上午 / 下午 → 全天 + 12:00 / 18:00 闹钟；精确钟点 → due 就是那一刻。
-    时间词固定在最后（``defer 9 12 明天``），多号一次改完。
+    时间由调用方换算好，用 --due / --at / --slot 传进来（与 add 同一套语义）：
+    只给日期 → 全天、无闹钟；--slot → 全天 + 12:00/18:00 闹钟；--at → due 就是那一刻。
+    多号一次改完。
 
     号来自 ``board_index``，规则与 done 一致（没出图 / 没这个号 / 已完成 都拒）。
     引用不变，所以**图上号也不变**：同一条只是换了日子，不重新编号。
@@ -926,21 +957,16 @@ def cmd_defer(ctx: Context, args) -> Result:
     带 ``recurrenceRule`` 的重复任务直接拒（见 ``_repeat_problem``）：EventKit
     的周期以 due 为锚点，改这一条等于把整条链的节奏一起挪走（2026-11-24 实测）。
     """
-    parsed = nlp.parse(args.when, now=ctx.now)
-    if _due_at(parsed, ctx.now) is None:
-        return _audited(Result({"ok": False, "results": [],
-                                "error": f"没从「{args.when}」里听出时间"
-                                         f"（defer 只改期，不改标题）"}, code=EXIT_PARAM),
-                        parsed)
+    when = _when_of(args)
     before = _defer_snapshot(ctx, args.seqs)
-    results = [_defer_one(ctx, raw, parsed, args.when) for raw in args.seqs]
+    results = [_defer_one(ctx, raw, when) for raw in args.seqs]
     ok = all(item["ok"] for item in results)
     return _audited(Result({"ok": ok, "results": results},
                            code=EXIT_OK if ok else EXIT_FAIL),
-                    parsed, before, after=results)
+                    _spec("", when, None, None), before, after=results)
 
 
-def _defer_one(ctx: Context, raw, parsed, when: str) -> dict:
+def _defer_one(ctx: Context, raw, when: timeutil.When) -> dict:
     """改一条的到期时间；号不对 / 已完成 / 还在收件箱都返回 ok:False。"""
     try:
         number = int(raw)
@@ -953,7 +979,7 @@ def _defer_one(ctx: Context, raw, parsed, when: str) -> dict:
     if kind == INBOX_LIST_LABEL:      # 念头还没进 Reminder，没有到期时间可改
         return {"seq": number, "ok": False, "ref": ref, "source": INBOX_LIST_LABEL,
                 "error": f"{number} 号还在收件箱里（没有到期时间）；"
-                         f"用 gtd clarify {number} \"{when}\" 定时间"}
+                         f"用 gtd clarify {number} --due {when.due.isoformat()} 定时间"}
     if kind != "reminder":
         return {"seq": number, "ok": False, "ref": ref, "error": f"不认识的引用 {ref}"}
     gone = _reminder_problem(ctx, target)
@@ -963,23 +989,18 @@ def _defer_one(ctx: Context, raw, parsed, when: str) -> dict:
     if repeated:
         return {"seq": number, "ok": False, "ref": ref, "source": "reminder",
                 "error": repeated}
-    due_at = _due_at(parsed, ctx.now)
-    changed = ctx.store.reschedule(target, due_at, advance_minutes=_advance(parsed),
-                                   all_day=parsed.all_day, slot=parsed.slot)
+    changed = ctx.store.reschedule(target, when.moment,
+                                   advance_minutes=when.advance_minutes,
+                                   all_day=when.all_day, slot=when.slot)
     if not changed:
         return {"seq": number, "ok": False, "ref": ref, "source": "reminder",
                 "error": f"{number} 号的到期时间没改成（Reminder 写失败）"}
     item = {"seq": number, "ok": True, "ref": ref, "source": "reminder",
-            "due": due_at.date().isoformat(),
-            "at": _hhmm(due_at) if parsed.at is not None else None,
-            "all_day": _day_only(parsed), "slot": parsed.slot, "reminder_id": target}
+            "due": when.due.isoformat(),
+            "at": _hhmm(when.moment) if when.at is not None else None,
+            "all_day": when.all_day, "slot": when.slot, "reminder_id": target}
     warnings = _sync_mirror_due(ctx, target)
     return {**item, "warnings": warnings} if warnings else item
-
-
-def _day_only(parsed) -> bool:
-    """存进 Reminder 的 due 是不是「只有日期」：时段（上午/下午）也走全天，只是另挂闹钟。"""
-    return bool(parsed.all_day or parsed.slot)
 
 
 def _defer_snapshot(ctx: Context, raws) -> list[dict]:
@@ -1186,10 +1207,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add(sub) -> None:
     p = sub.add_parser("add", help="记一条：有时间进 Reminder，没时间进收件箱")
-    p.add_argument("text")
+    p.add_argument("text", help="标题（原样入库，不做词剥离）")
+    p.add_argument("--due", metavar="YYYY-MM-DD",
+                   help="到期日；不给就进收件箱（例：2026-12-01）")
+    _when_flags(p)
+    p.add_argument("--repeat", choices=rep.FLAGS,
+                   help="重复频率；锚点就是 --due 那天（daily / weekly / monthly）")
+    p.add_argument("--repeat-interval", type=int, default=1, metavar="N",
+                   help="每隔几个周期一次（默认 1；例：--repeat weekly --repeat-interval 2）")
+    p.add_argument("--priority", choices=prio.PRIORITIES, default=prio.PRIORITY_NONE,
+                   help="优先级 none/low/medium/high（默认 none）")
     p.add_argument("--note", default="")
-    p.add_argument("--priority", choices=prio.PRIORITIES, default=None,
-                   help="手动指定优先级（覆盖从「很重要 / 急」里识别出来的那档）")
+
+
+def _when_flags(p) -> None:
+    """三个时间旗标在 add / defer / clarify 上完全同一套。"""
+    p.add_argument("--at", metavar="HH:MM",
+                   help="具体钟点，24 小时制（例：09:30）；与 --slot 互斥")
+    p.add_argument("--slot", choices=timeutil.SLOTS,
+                   help="时段 am|pm：due 全天 + 12:00/18:00 闹钟")
 
 
 def _inbox(sub) -> None:
@@ -1200,7 +1236,8 @@ def _clarify(sub) -> None:
     p = sub.add_parser("clarify", help="给收件箱里的念头补时间")
     p.add_argument("number", metavar="N", type=int,
                    help="当日序号（board / inbox 上的号）；没有序号时按 inbox 行 id")
-    p.add_argument("text")
+    p.add_argument("--due", metavar="YYYY-MM-DD", help="到期日（必填，例：2026-12-01）")
+    _when_flags(p)
 
 
 def _priority(sub) -> None:
@@ -1229,10 +1266,9 @@ def _done(sub) -> None:
 
 def _defer(sub) -> None:
     p = sub.add_parser("defer", help="按当日序号改到期时间（改期，不是完成；可多个）")
-    p.add_argument("seqs", nargs="+", metavar="N...",
-                   help="图上号；时间词固定在最后：defer 9 12 明天上午")
-    p.add_argument("when", metavar="WHEN",
-                   help="时间词，与 add 同一套：明天 / 明天上午 / 明天10点 / 今晚10点半")
+    p.add_argument("seqs", nargs="+", metavar="N...", help="图上号，可多个")
+    p.add_argument("--due", metavar="YYYY-MM-DD", help="新到期日（必填，例：2026-12-01）")
+    _when_flags(p)
 
 
 def _list(sub) -> None:

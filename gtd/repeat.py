@@ -7,8 +7,9 @@ every N days/weeks/months/years``。实测（2026-11-23，真机建 ZZ 测试条
 - ``biweekly`` 与 ``every 2 weeks`` → 都是 ``{"frequency": "weekly", "interval": 2}``
 - ``monthly`` → ``{"frequency": "monthly", "interval": 1}``
 
-所以「写法」与「EventKit 规则」是两个面向：parser 把人话变成写法，adapter 把写法
-交给 remindctl，读侧把规则折回写法给视图。三处都 import 这里，别各抄一份映射。
+所以「写法」与「EventKit 规则」是两个面向：CLI 把旗标（``--repeat`` +
+``--repeat-interval``）变成写法，adapter 把写法交给 remindctl，读侧把规则折回写法给
+视图。三处都 import 这里，别各抄一份映射。
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import re
 from datetime import date, timedelta
 
 FREQUENCIES = ("daily", "weekly", "monthly", "yearly")
+FLAGS = ("daily", "weekly", "monthly")       # --repeat 只开放这三档
+FLAG_UNITS = {"daily": "days", "weekly": "weeks", "monthly": "months"}
 BIWEEKLY = "biweekly"
 NAMED_LABELS = {"daily": "每天", "weekly": "每周", "biweekly": "每两周",
                 "monthly": "每月", "yearly": "每年"}
@@ -35,6 +38,24 @@ def _every(value: str) -> tuple[int, str] | None:
         return None
     count = int(found.group("n"))
     return (count, found.group("unit")) if count > 0 else None
+
+
+def spec(frequency, interval=1) -> str | None:
+    """``--repeat`` + ``--repeat-interval`` → remindctl 的写法；认不出给 None。
+
+    ``weekly`` + 2 给人看是「每两周」，写法仍是 ``every 2 weeks``（读侧 ``from_rule``
+    会折回 ``biweekly``）。映射只此一份，别在 cli 里再抄。
+    """
+    text = str(frequency or "").strip().lower()
+    if text not in FLAG_UNITS:
+        return None
+    try:
+        count = int(interval)
+    except (TypeError, ValueError):
+        return None
+    if count < 1:
+        return None
+    return text if count == 1 else f"every {count} {FLAG_UNITS[text]}"
 
 
 def normalize(value) -> str | None:
