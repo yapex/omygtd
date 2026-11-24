@@ -55,9 +55,9 @@ gtd [--db PATH] [--now WHEN] [--human] <subcommand>
 
 gtd add "<标题>" [--due YYYY-MM-DD] [--at HH:MM | --slot am|pm]
                  [--repeat daily|weekly|monthly] [--repeat-interval N]
-                 [--priority none|low|medium|high] [--note T]
+                 [--priority none|low|medium|high] [--list GTD|Waiting] [--note T]
 gtd inbox                                        # 收件箱里还没迁出的念头
-gtd clarify <N> --due YYYY-MM-DD [--at HH:MM | --slot am|pm]
+gtd clarify <N> --due YYYY-MM-DD [--at HH:MM | --slot am|pm] [--list GTD|Waiting]
 gtd view [--format {md,json}]                    # 全库视图，md 是默认
 gtd board [--out PATH]                           # 出 PNG：board-YYYYMMDD-HHMMSS.png + today-YYYYMMDD.png
 gtd done <N...>                                  # 按图上编号完成，可多个
@@ -71,6 +71,11 @@ gtd doctor                                       # 体检：收件箱积压 / Re
 - 默认输出 JSON；退出码 **0 成功 / 1 业务失败（号不对、已完成、写失败）/ 2 参数错（日期或钟点不合标准格式、旗标组合不合法）**
 - `--now "2026-11-23 09:00"` 钉住时刻（测试用）
 - `add` 幂等：内容指纹 + **2 分钟**窗口，不要传 key
+
+**`--list` 只有两面：`GTD`（默认）与 `Waiting`。** 「等对方回复 / 等报价 / 等审批」这类落
+`Waiting`：`gtd add "等对方报价" --list Waiting --due 2026-12-01`。`defer` 没有 `--list`
+（改期不改归属）。临时库 / 测试库一律写 `GTD_TEST`（`--list` 不改变隔离），正式 `GTD` /
+`Waiting` 只有正式库 `data/gtd.db` 才写。
 
 **旧写法已全部失效**：口语时间词（`gtd add "明天 买菜"` 想让 CLI 自己听懂）、`defer 9 明天`、
 `clarify 3 "明天下午"`、`--category` / `--waiting-on` / 旧旗标 `--defer`、`board --view` /

@@ -67,6 +67,7 @@ def _check_args(args) -> None:
         return
     _when_of(args)
     _check_repeat(args)
+    _check_list(args)
 
 
 def _check_repeat(args) -> None:
@@ -82,6 +83,22 @@ def _check_repeat(args) -> None:
     if interval < 1:
         raise ParamError(f"--repeat-interval 必须是正整数，收到「{interval}」"
                          "（例：--repeat weekly --repeat-interval 2）")
+
+
+def _check_list(args) -> None:
+    """``--list`` 只认 GTD / Waiting；add 没 --due 时不许点名列表（先进收件箱）。
+
+    非法值走退出码 2 并带示例，别让 argparse 回一句冷冰冰的 invalid choice。
+    """
+    name = getattr(args, "list", None)
+    if name is None:
+        return
+    if name not in timeutil.LISTS:
+        raise ParamError(f"--list 只接受 {' / '.join(timeutil.LISTS)}"
+                         f"（例：--list Waiting 记「等对方回复」），收到「{name}」")
+    if args.command == "add" and args.due is None:
+        raise ParamError("--list 要和 --due 一起用（没时间就先进收件箱，列表等 clarify 再定）"
+                         "（例：--list Waiting --due 2026-12-01）")
 
 
 def _when_of(args) -> timeutil.When:
@@ -117,15 +134,16 @@ def is_prod_db(db) -> bool:
     return Path(db or ":memory:").resolve() == Path(DEFAULT_DB).resolve()
 
 
-def target_list(db) -> str:
-    """写 Reminder 用哪张列表：**非正式库一律 GTD_TEST**（测试隔离），正式库写 GTD。
+def target_list(db, requested: str | None = None) -> str:
+    """写 Reminder 用哪张列表：正式库照 ``--list``（默认 GTD），非正式库一律 GTD_TEST。
 
-    老板 2026-11-23 定的规矩：临时库 / 测试库写来的任务不许混进真实 ``GTD``。
-    列表不再从话里解析，所以只按 db 路径判（这里一处决定，add / clarify 都走它）。
+    老板 2026-11-23 定的规矩：临时库 / 测试库写来的任务不许混进真实 ``GTD`` / ``Waiting``。
+    所以**隔离优先**：哪怕传了 ``--list Waiting``，临时库也只写 GTD_TEST。
+    列表名只从这里出（add / clarify 都走它），别在各处自己拼。
     """
     if not is_prod_db(db):
         return TEST_LIST
-    return timeutil.LIST_DEFAULT
+    return requested or timeutil.LIST_DEFAULT
 
 
 @dataclass
@@ -296,21 +314,25 @@ def _hhmm(moment: datetime) -> str:
     return moment.strftime("%H:%M")
 
 
-def _list_of(ctx: Context) -> str:
-    """这次写哪张列表：跟着库走（临时库 → GTD_TEST），不看人记不记得。"""
-    return target_list(ctx.db)
+def _list_of(ctx: Context, args=None) -> str:
+    """这次写哪张列表：正式库按 ``--list``（默认 GTD），临时库一律 GTD_TEST。"""
+    return target_list(ctx.db, getattr(args, "list", None))
 
 
-def _ensure_lists(ctx: Context) -> None:
-    """写之前确保目标列表存在：正式库建 GTD / Waiting，临时库只建 GTD_TEST。
+def _ensure_lists(ctx: Context, name: str | None = None) -> None:
+    """写之前确保目标列表存在：正式库确保要写的那张，临时库只建 GTD_TEST。
 
     ``remindctl list <name> --create`` 是幂等的（已存在时不动里面的条目），
-    所以新机器 / 列表被删了也能自愈。
+    所以新机器 / 列表被删了也能自愈。``name`` 跟着 ``_list_of()`` 的返回值走——
+    写 Waiting 就确保 Waiting，别只确保 GTD 然后往不存在的列表里写。
     """
-    if not ctx.test_db:
-        ctx.store.ensure_lists()
+    if ctx.test_db:
+        _ensure_one(ctx.store, TEST_LIST)
         return
-    _ensure_one(ctx.store, TEST_LIST)
+    if name is None:
+        ctx.store.ensure_lists()          # 没点名目标（老调用点）→ GTD + Waiting 全量
+        return
+    _ensure_one(ctx.store, name)
 
 
 def _ensure_one(store: ReminderStore, name: str) -> None:
@@ -432,22 +454,24 @@ def cmd_add(ctx: Context, args) -> Result:
     if when.due is None:
         return _audited(_park(ctx, args.text, when, args.note,
                               level=level, cycle=cycle), spec)
-    _ensure_lists(ctx)
-    reminder_id = ctx.store.add(args.text, when.moment, _list_of(ctx),
+    list_name = _list_of(ctx, args)
+    _ensure_lists(ctx, list_name)
+    reminder_id = ctx.store.add(args.text, when.moment, list_name,
                                 advance_minutes=when.advance_minutes, note=args.note,
                                 all_day=when.all_day, slot=when.slot,
                                 priority=level, repeat=cycle)
     if not reminder_id:
         return _audited(_park(ctx, args.text, when, args.note, level=level, cycle=cycle,
                               error="Reminder 写不进去，已留在收件箱"), spec)
-    return _audited(Result(_landed(ctx, args.text, reminder_id, when, level, cycle)), spec)
+    return _audited(Result(_landed(ctx, args.text, reminder_id, when, level, cycle,
+                                   list_name)), spec)
 
 
 def _landed(ctx: Context, title: str, reminder_id: str, when: timeutil.When,
-            level=None, cycle=None) -> dict:
+            level=None, cycle=None, list_name: str | None = None) -> dict:
     """写成功后的回执：``at`` 只报具体时刻，全天/时段另给标记（别把 00:00 当时刻）。"""
     return {"ok": True, "seq": _seq_of(ctx, f"reminder:{reminder_id}"),
-            "title": title, "list": _list_of(ctx),
+            "title": title, "list": list_name or _list_of(ctx),
             "due": when.due.isoformat(),
             "at": _hhmm(when.moment) if when.at is not None else None,
             "all_day": when.all_day, "slot": when.slot,
@@ -503,8 +527,9 @@ def cmd_clarify(ctx: Context, args) -> Result:
     before = _inbox_snapshot(row)
     title, level = row["title"], prio.normalize(row.get("priority"))
     spec = _spec(title, when, level, None)
-    _ensure_lists(ctx)
-    reminder_id = ctx.store.add(title, when.moment, _list_of(ctx),
+    list_name = _list_of(ctx, args)
+    _ensure_lists(ctx, list_name)
+    reminder_id = ctx.store.add(title, when.moment, list_name,
                                 advance_minutes=when.advance_minutes,
                                 note=row["note"], all_day=when.all_day,
                                 slot=when.slot, priority=level, repeat=None)
@@ -512,7 +537,7 @@ def cmd_clarify(ctx: Context, args) -> Result:
         return _audited(Result({"ok": False, "error": "Reminder 写不进去，念头留在收件箱",
                                 "inbox_id": row["id"]}, code=EXIT_FAIL), spec, before)
     ctx.inbox.mark_moved(row["id"], reminder_id, now=ctx.now)
-    payload = _landed(ctx, title, reminder_id, when, level, None)
+    payload = _landed(ctx, title, reminder_id, when, level, None, list_name)
     payload["inbox_id"] = row["id"]
     after = _inbox_snapshot(ctx.inbox.get(row["id"]))
     return _audited(Result(payload), spec, before, after=after)
@@ -1217,6 +1242,9 @@ def _add(sub) -> None:
                    help="每隔几个周期一次（默认 1；例：--repeat weekly --repeat-interval 2）")
     p.add_argument("--priority", choices=prio.PRIORITIES, default=prio.PRIORITY_NONE,
                    help="优先级 none/low/medium/high（默认 none）")
+    p.add_argument("--list", metavar="GTD|Waiting", default=None,
+                   help="写哪张列表：GTD（默认）/ Waiting（等对方回复这类）"
+                        "；例：--list Waiting")
     p.add_argument("--note", default="")
 
 
@@ -1237,6 +1265,9 @@ def _clarify(sub) -> None:
     p.add_argument("number", metavar="N", type=int,
                    help="当日序号（board / inbox 上的号）；没有序号时按 inbox 行 id")
     p.add_argument("--due", metavar="YYYY-MM-DD", help="到期日（必填，例：2026-12-01）")
+    p.add_argument("--list", metavar="GTD|Waiting", default=None,
+                   help="写哪张列表：GTD（默认）/ Waiting（等对方回复这类）"
+                        "；例：--list Waiting")
     _when_flags(p)
 
 
