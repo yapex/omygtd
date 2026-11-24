@@ -895,6 +895,22 @@ def _reminder_problem(ctx: Context, reminder_id: str) -> str | None:
     return "这条已经不在 Reminder 里了，重新看图"
 
 
+def _repeat_problem(ctx: Context, reminder_id: str) -> str | None:
+    """重复任务不许 ``defer``：EventKit 的周期规则以 dueDate 为锚点滚动。
+
+    实测（2026-11-24，GTD_TEST，weekly/1 那条）：``edit --due`` 之后
+    ``recurrenceRule`` 本身不变（frequency / interval 都在），但 ``complete``
+    往前滚的是**改后的 due**——周一的任务 defer 到周三，滚出来是下周三，
+    原周一锚点就丢了。所以这里直接拒：要改节奏去 Reminders.app 里改频率。
+    """
+    item = _reminder_item(ctx, reminder_id)
+    if item is None:
+        return None
+    if item.get("recurrenceRule") or item.get("repeat"):
+        return "重复任务暂不支持 defer（改期会把重复节奏的锚点一起挪走），请改 Reminder 里的频率"
+    return None
+
+
 # ---------------------------------------------------------------- defer
 
 def cmd_defer(ctx: Context, args) -> Result:
@@ -907,6 +923,8 @@ def cmd_defer(ctx: Context, args) -> Result:
     号来自 ``board_index``，规则与 done 一致（没出图 / 没这个号 / 已完成 都拒）。
     引用不变，所以**图上号也不变**：同一条只是换了日子，不重新编号。
     镜像那一行的 due 跟着改（可整表重建的备份，别让本地副本落后）。
+    带 ``recurrenceRule`` 的重复任务直接拒（见 ``_repeat_problem``）：EventKit
+    的周期以 due 为锚点，改这一条等于把整条链的节奏一起挪走（2026-11-24 实测）。
     """
     parsed = nlp.parse(args.when, now=ctx.now)
     if _due_at(parsed, ctx.now) is None:
@@ -941,6 +959,10 @@ def _defer_one(ctx: Context, raw, parsed, when: str) -> dict:
     gone = _reminder_problem(ctx, target)
     if gone:
         return {"seq": number, "ok": False, "ref": ref, "error": gone}
+    repeated = _repeat_problem(ctx, target)      # 重复任务改期会挪走锚点，拒
+    if repeated:
+        return {"seq": number, "ok": False, "ref": ref, "source": "reminder",
+                "error": repeated}
     due_at = _due_at(parsed, ctx.now)
     changed = ctx.store.reschedule(target, due_at, advance_minutes=_advance(parsed),
                                    all_day=parsed.all_day, slot=parsed.slot)

@@ -220,6 +220,21 @@ def test_defer_keeps_the_board_number(capsys, db, fake, tmp_path, monkeypatch):
     assert ref == f"reminder:{added['reminder_id']}"
 
 
+def test_defer_repeat_item_is_rejected(capsys, db, fake, tmp_path, monkeypatch):
+    """重复任务不许 defer：改期会把 EventKit 的重复锚点一起挪走（2026-11-24 实测）。"""
+    added = run(capsys, ["add", "周一 每周 冒烟重复任务"], db=db, store=fake)[1]
+    assert added["repeat"] == "weekly"          # 「每周」才带周期，「每周一」只是星期几
+    board(capsys, db, fake, tmp_path, monkeypatch)
+
+    code, data = run(capsys, ["defer", "1", "明天上午"], db=db, store=fake)
+    assert code == 1 and data["ok"] is False
+    result = data["results"][0]
+    assert result["ok"] is False and "重复任务暂不支持 defer" in result["error"]
+    assert fake.rescheduled == [], "重复任务一条都不许改"
+    stored = item_of(fake, added["reminder_id"])
+    assert stored["repeat"] == "weekly" and stored["dueDate"] == added["due"]
+
+
 # ---------------------------------------------------------------- adapter
 
 def test_adapter_sends_due_and_clears_stale_alarm(monkeypatch):
